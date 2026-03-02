@@ -5,6 +5,7 @@ import re
 def run_phase1(input_file):
     print("🚀 Starting Phase 1: Data Cleaning & Explosion...")
     df = pd.read_csv(input_file)
+    df = df.loc[:, ~df.columns.str.match(r'^Unnamed')]
     TOTAL_CHAUPALS = len(df)
 
     # --- PART A: STANDARDIZE COUNTS (Same as before) ---
@@ -38,7 +39,9 @@ def run_phase1(input_file):
         temp_df[col_name] = temp_df[col_name].fillna("None").str.split('|')
         exploded = temp_df.explode(col_name)
         exploded[col_name] = exploded[col_name].str.strip().apply(lambda x: re.sub(r'^\d+\.\s*', '', str(x)))
-        return exploded[exploded[col_name].str.len() > 2]
+        exploded = exploded[exploded[col_name].str.len() > 2]
+        exploded = exploded.loc[:, ~exploded.columns.str.match(r'^Unnamed')]
+        return exploded
 
     df_chal = explode_col(df, 'Challenges')
     df_sol = explode_col(df, 'Solutions')
