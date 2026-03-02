@@ -2,6 +2,12 @@
 
 This document explains exactly how data flows through the pipeline, how each report section is computed, and what AI prompts are used for tagging and refinement.
 
+We run the report in 4 stages. 
+First, we clean the raw discussion data so participant numbers are correct and consistent. 
+Second, we split long responses into individual challenge and solution points so each idea is counted properly. 
+Third, we use AI to group similar statements (for example, many versions of “no money” become one common issue) and tag each under one theme. 
+Fourth, we calculate district and state-level insights (participation, top problems, common solutions, community-led vs system-led actions) and automatically build the final Word report section by section.
+
 ## 1) End-to-End Pipeline Logic
 
 The project follows a deterministic sequence:
