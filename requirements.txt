@@ -1,0 +1,12 @@
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Document Generation
+python-docx>=1.1.0
+
+# Utilities
+tqdm>=4.65.0
+python-dotenv>=1.0.0
+
+boto3>=1.34.0

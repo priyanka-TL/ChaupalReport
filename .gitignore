@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+*.egg
+*.log
+*.sqlite3
+*.db
+*.DS_Store
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# Virtual environments
+sc_report_env/
+venv/
+.env/
+.envrc
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# CSV and data outputs
+*.csv
+*.tsv
+*.xls
+*.xlsx
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.db
+*.sqlite
+
+# Misc
+*.bak
+*.swp
+*.swo
+*.tmp
+*.orig
+
+# Ignore report outputs
+Chaupal4/*.csv
+sc_report_env*
+*.docx
