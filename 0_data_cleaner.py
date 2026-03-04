@@ -54,4 +54,4 @@ def clean_participant_data(file_path, output_path):
 
 if __name__ == "__main__":
     # Input: your raw file | Output: the file for Step 1
-    clean_participant_data('raw_data.csv', 'cleaned_data.csv')
+    clean_participant_data('sample.csv', 'cleaned_data.csv')

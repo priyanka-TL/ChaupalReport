@@ -80,10 +80,18 @@ pip install pandas numpy python-docx boto3 tqdm python-dotenv
 
 Set the following before running AI scripts:
 
+- `LLM_PROVIDER` (`claude` or `gemini`)
+
+If `LLM_PROVIDER=claude`:
 - `AWS_ACCESS_KEY_ID`
 - `AWS_SECRET_ACCESS_KEY`
-- Region used in code: `ap-south-1`
-- Model used: `global.anthropic.claude-sonnet-4-5-20250929-v1:0`
+- `AWS_REGION` (default: `ap-south-1`)
+- `CLAUDE_MODEL_ID` (default: `global.anthropic.claude-sonnet-4-5-20250929-v1:0`)
+- `CLAUDE_MODEL_VERSION` (default: `bedrock-2023-05-31`)
+
+If `LLM_PROVIDER=gemini`:
+- `GEMINI_API_KEY`
+- `GEMINI_MODEL` (default: `gemini-2.0-flash`)
 
 You can place secrets in a `.env` file (loaded via `python-dotenv`).
 

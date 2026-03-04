@@ -2,24 +2,18 @@ import pandas as pd
 import os
 import time
 import io
-import json
-import boto3
+import random
 from tqdm import tqdm
 from dotenv import load_dotenv
+from llm_provider import LLMProvider
 
 load_dotenv()
 
-# --- YOUR SPECIFIC AWS CONFIGURATION ---
-claude_beadrock_client = boto3.client(
-    "bedrock-runtime",
-    region_name="ap-south-1",  # As per your config
-    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-)
-
-
-MODEL_ID = "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
-MODEL_VERSION = "bedrock-2023-05-31"
+try:
+    llm_provider = LLMProvider()
+except Exception as error:
+    print(f"⚠️ LLM setup failed: {error}")
+    llm_provider = None
 
 THEME_KNOWLEDGE_BASE = """
 1. Poverty and Economic Barriers: Financial hardship, child labour. Keywords: Poor, no money.
@@ -34,7 +28,42 @@ THEME_KNOWLEDGE_BASE = """
 10. Other Factors: General awareness, migration. (Target <10%)
 """
 
-def get_ai_mapping_bedrock(text_batch, type_label):
+MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "5"))
+BASE_RETRY_SECONDS = float(os.getenv("LLM_RETRY_BASE_SECONDS", "2"))
+MAX_RETRY_SECONDS = float(os.getenv("LLM_RETRY_MAX_SECONDS", "45"))
+
+
+def is_retryable_error(error):
+    message = str(error).lower()
+    retry_signals = [
+        "429",
+        "rate limit",
+        "resource_exhausted",
+        "too many requests",
+        "throttle",
+        "temporarily unavailable",
+        "timeout",
+    ]
+    return any(signal in message for signal in retry_signals)
+
+
+def save_progress(output_csv, batch_df):
+    if batch_df.empty:
+        return
+
+    if os.path.exists(output_csv):
+        existing_df = pd.read_csv(output_csv)
+        merged_df = pd.concat([existing_df, batch_df], ignore_index=True)
+        merged_df = merged_df.drop_duplicates(subset=["Original"], keep="last")
+    else:
+        merged_df = batch_df.copy()
+
+    merged_df.to_csv(output_csv, index=False)
+
+def get_ai_mapping(text_batch, type_label):
+    if not llm_provider:
+        raise RuntimeError("LLM provider is not configured")
+
     prompt_content = f"""Act as an expert Social Data Analyst. Use these THEMES:
     {THEME_KNOWLEDGE_BASE}
     
@@ -57,35 +86,11 @@ def get_ai_mapping_bedrock(text_batch, type_label):
     DATA:
     {text_batch}"""
 
-    native_request = {
-        "anthropic_version": MODEL_VERSION,
-        "max_tokens": 4000,
-        "temperature": 0,
-        "messages": [
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": prompt_content}]
-            }
-        ]
-    }
+    raw_output = llm_provider.generate_text(prompt_content, max_tokens=4000, temperature=0)
 
-    try:
-        response = claude_beadrock_client.invoke_model(
-            modelId=MODEL_ID,
-            body=json.dumps(native_request)
-        )
-        response_body = json.loads(response.get('body').read())
-        raw_output = response_body['content'][0]['text'].strip()
-        
-        # Strip potential garbage
-        raw_output = raw_output.replace('```csv', '').replace('```', '').strip()
-        
-        # Load into DF (Expects: Original|Theme|Merged_Concept)
-        df_batch = pd.read_csv(io.StringIO(raw_output), sep='|', names=['Original', 'Theme', 'Merged_Concept'], header=None)
-        return df_batch
-    except Exception as e:
-        print(f"Error in batch: {e}")
-        return pd.DataFrame()
+    raw_output = raw_output.replace('```csv', '').replace('```', '').strip()
+    df_batch = pd.read_csv(io.StringIO(raw_output), sep='|', names=['Original', 'Theme', 'Merged_Concept'], header=None)
+    return df_batch
 
 def process_file(input_csv, output_csv, type_label):
     if not os.path.exists(input_csv):
@@ -94,32 +99,68 @@ def process_file(input_csv, output_csv, type_label):
 
     df_unique = pd.read_csv(input_csv)
     unique_list = df_unique['text'].dropna().unique().tolist()
-    
-    final_dfs = []
+
+    already_processed = set()
+    if os.path.exists(output_csv):
+        try:
+            existing_output = pd.read_csv(output_csv)
+            if 'Original' in existing_output.columns:
+                already_processed = set(existing_output['Original'].dropna().astype(str).tolist())
+                print(f"♻️ Resume mode: found {len(already_processed)} already processed {type_label} rows in {output_csv}")
+        except Exception as read_error:
+            print(f"⚠️ Could not read existing output for resume: {read_error}")
+
+    pending_list = [item for item in unique_list if str(item) not in already_processed]
+    if not pending_list:
+        print(f"✅ Nothing pending for {type_label}. {output_csv} is already up to date.")
+        return
+
     batch_size = 50  # Set to 50 to avoid output token limits with large datasets
-    
-    total_batches = (len(unique_list) + batch_size - 1) // batch_size
-    print(f"🔍 Analyzing {len(unique_list)} Unique {type_label}s via Claude 3.7 (ap-south-1)...")
+
+    total_batches = (len(pending_list) + batch_size - 1) // batch_size
+    provider_name = llm_provider.describe() if llm_provider else "unknown-llm"
+    print(f"🔍 Analyzing {len(pending_list)} pending Unique {type_label}s via {provider_name}...")
     print(f"   Total Batches: {total_batches} | Batch Size: {batch_size}")
 
-    for i in tqdm(range(0, len(unique_list), batch_size)):
+    for i in tqdm(range(0, len(pending_list), batch_size)):
         current_batch = (i // batch_size) + 1
         print(f"   ⏳ Processing Batch {current_batch}/{total_batches}...")
-        
-        batch = "\n".join(unique_list[i : i + batch_size])
-        mapped_df = get_ai_mapping_bedrock(batch, type_label)
+
+        current_items = pending_list[i : i + batch_size]
+        batch = "\n".join(current_items)
+        mapped_df = pd.DataFrame()
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                mapped_df = get_ai_mapping(batch, type_label)
+                break
+            except Exception as batch_error:
+                retryable = is_retryable_error(batch_error)
+                should_retry = retryable and attempt < MAX_RETRIES
+
+                print(f"      ⚠️ Batch {current_batch} attempt {attempt}/{MAX_RETRIES} failed: {batch_error}")
+                if should_retry:
+                    delay = min(MAX_RETRY_SECONDS, BASE_RETRY_SECONDS * (2 ** (attempt - 1)))
+                    delay += random.uniform(0, 0.5)
+                    print(f"      🔁 Retrying in {delay:.1f}s...")
+                    time.sleep(delay)
+                    continue
+
+                print(f"      ❌ Batch {current_batch} failed after {attempt} attempt(s).")
+                mapped_df = pd.DataFrame()
+                break
+
         if not mapped_df.empty:
-            final_dfs.append(mapped_df)
-            print(f"      ✅ Batch {current_batch} done. Got {len(mapped_df)} items.")
+            save_progress(output_csv, mapped_df)
+            print(f"      ✅ Batch {current_batch} done. Saved {len(mapped_df)} rows to {output_csv}.")
         else:
-            print(f"      ⚠️ Batch {current_batch} returned empty or failed.")
-            
+            print(f"      ⚠️ Batch {current_batch} produced no usable rows.")
+
         time.sleep(0.5) 
-        
-    if final_dfs:
-        result_df = pd.concat(final_dfs, ignore_index=True)
-        result_df.to_csv(output_csv, index=False)
-        print(f"✅ Mapping successfully saved to {output_csv}")
+
+    if os.path.exists(output_csv):
+        final_rows = len(pd.read_csv(output_csv))
+        print(f"✅ Mapping successfully saved to {output_csv} | Total rows now: {final_rows}")
 
 if __name__ == "__main__":
     # Ensure these files exist from Phase 1

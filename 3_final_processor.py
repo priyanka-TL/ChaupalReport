@@ -1,29 +1,24 @@
 import pandas as pd
 import re
 import os
+import time
+import random
 from docx import Document
 from docx.shared import Pt
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 import json
-import boto3
 from dotenv import load_dotenv
+from llm_provider import LLMProvider
 
 load_dotenv()
 
-# --- AWS CONFIGURATION ---
+# --- LLM CONFIGURATION ---
 try:
-    claude_client = boto3.client(
-        "bedrock-runtime",
-        region_name="ap-south-1",
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-    )
+    llm_provider = LLMProvider()
 except Exception as e:
-    print(f"⚠️ AWS Client Setup Failed: {e}")
-    claude_client = None
-
-MODEL_ID = "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
+    print(f"⚠️ LLM Client Setup Failed: {e}")
+    llm_provider = None
 
 THEME_KNOWLEDGE_BASE = """
 1. Poverty and Economic Barriers
@@ -37,6 +32,48 @@ THEME_KNOWLEDGE_BASE = """
 9. Substance Abuse & Addiction
 10. Other Factors
 """
+
+MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "5"))
+BASE_RETRY_SECONDS = float(os.getenv("LLM_RETRY_BASE_SECONDS", "2"))
+MAX_RETRY_SECONDS = float(os.getenv("LLM_RETRY_MAX_SECONDS", "45"))
+REFINE_CHECKPOINT_DIR = os.getenv("REFINE_CHECKPOINT_DIR", ".")
+
+
+def is_retryable_error(error):
+    message = str(error).lower()
+    retry_signals = [
+        "429",
+        "rate limit",
+        "resource_exhausted",
+        "too many requests",
+        "throttle",
+        "temporarily unavailable",
+        "timeout",
+    ]
+    return any(signal in message for signal in retry_signals)
+
+
+def get_refinement_checkpoint_path(type_label):
+    safe_label = str(type_label).strip().lower().replace(" ", "_")
+    return os.path.join(REFINE_CHECKPOINT_DIR, f"refine_checkpoint_{safe_label}.json")
+
+
+def load_refinement_checkpoint(checkpoint_path):
+    if not os.path.exists(checkpoint_path):
+        return {}
+    try:
+        with open(checkpoint_path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        return data if isinstance(data, dict) else {}
+    except Exception as error:
+        print(f"   ⚠️ Could not read refinement checkpoint {checkpoint_path}: {error}")
+        return {}
+
+
+def save_refinement_checkpoint(checkpoint_path, results):
+    os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
+    with open(checkpoint_path, "w", encoding="utf-8") as file:
+        json.dump(results, file, ensure_ascii=False, indent=2)
 
 def categorize_environment_aggressive(text):
     """Ultra-Aggressive Environment Classification to minimize Unmapped tags."""
@@ -110,6 +147,141 @@ def clean_theme_name(text):
     
     return text
 
+def _challenge_item_insight(theme, concept, share, count, t_c, t_s, challenge_texts, max_words=100):
+    """Creates 2-3 deep, specific insight sentences (max 100 words) revealing ground realities."""
+    total_theme_chal = len(t_c)
+    total_theme_sol = len(t_s)
+
+    concept_rows = t_c[t_c['Merged_Concept'] == concept]
+    districts = concept_rows['District'].nunique() if not concept_rows.empty and 'District' in concept_rows.columns else 0
+
+    env_text = "Not available"
+    if not concept_rows.empty and 'Environment' in concept_rows.columns:
+        env_mix = concept_rows['Environment'].value_counts(normalize=True)
+        if not env_mix.empty:
+            env_text = f"{env_mix.index[0]}"
+
+    # Sample actual ground scenarios for deeper analysis
+    sample_texts = challenge_texts[:8] if len(challenge_texts) > 8 else challenge_texts
+    scenarios_text = " || ".join(sample_texts)
+
+    # Fallback insights - direct, analytical
+    fallback = (
+        f"This represents {share:.1f}% of theme challenges, indicating a systemic issue rather than isolated incidents. "
+        f"The pattern manifests primarily in {env_text} settings, pointing to where interventions must be anchored. "
+        f"With {districts} district(s) reporting this challenge, it requires {'localized' if districts <= 2 else 'coordinated multi-district'} response strategies."
+    )
+
+    if not llm_provider:
+        return [fallback]
+
+    prompt = f"""You are analyzing on-ground education barriers from grassroots dialogue data.
+
+ANALYZE THESE ACTUAL GROUND SCENARIOS:
+{scenarios_text}
+
+CONTEXT:
+- Theme: {theme}
+- Number of similar cases: {count} ({share:.1f}% of theme)
+- Geographic spread: {districts} district(s)
+- Primary setting: {env_text}
+
+TASK:
+Write 2-3 DISTINCT, NON-REPETITIVE insights that reveal the BROADER PICTURE of what's happening on the ground.
+
+EACH INSIGHT MUST COVER A DIFFERENT DIMENSION:
+✓ Insight 1: What MECHANISM/TRIGGER causes this barrier? (e.g., sudden economic shocks, rigid documentation rules, infrastructure gaps)
+✓ Insight 2: WHO is most affected and WHAT cascading effects occur? (e.g., girls withdrawn first, entire families pulled out, seasonal disruptions)
+✓ Insight 3 (if needed): What SYSTEMIC PATTERN or broader implication emerges? (e.g., policy-implementation gaps, urban-rural divide, poverty multipliers)
+
+CRITICAL REQUIREMENTS:
+✗ NO repetition - each sentence must add NEW information, not rephrase the same point
+✗ NO generic statements like "barriers impede access" or "factors prevent education"
+✗ NO explicit references to "voices," "testimonials," or "participants said"
+✗ NO repetition of the challenge concept name (it's in the heading above)
+✓ Be CONCRETE and SPECIFIC about mechanisms, triggers, affected groups, cascading effects
+✓ Synthesize the BROADER PICTURE from multiple scenarios - what patterns emerge?
+✓ Each insight should answer a DIFFERENT question about the challenge
+✓ Use PERFECT grammar, spelling, and punctuation - proofread carefully
+✓ Write in complete, well-structured sentences with proper syntax
+
+EXAMPLE OF NON-REPETITIVE INSIGHTS:
+❌ BAD (repetitive): "Rigid enforcement blocks children. Inflexibility disqualifies students."
+✅ GOOD (distinct dimensions): "Minor documentation discrepancies trigger automatic rejection during enrollment. Marginalized families—lacking digital literacy or correction mechanisms—face permanent exclusion, with no appeals process available."
+
+WORD LIMIT: Maximum 100 words total.
+
+OUTPUT: Return 2-3 distinct, non-overlapping, grammatically perfect insight sentences. Separate with double newlines."""
+
+    try:
+        response = llm_provider.generate_text(prompt, max_tokens=250, temperature=0.15)
+        cleaned = str(response).replace("```", "").strip()
+        
+        # Clean up text: fix spacing, grammar, and formatting
+        cleaned = _clean_text_output(cleaned)
+        
+        # Split into sentences/paragraphs
+        insights = [p.strip() for p in cleaned.split('\n\n') if p.strip()]
+        if not insights:
+            insights = [s.strip() + '.' for s in cleaned.split('.') if s.strip()]
+        
+        # Clean each insight individually
+        insights = [_clean_text_output(insight) for insight in insights]
+        
+        # Enforce 100-word limit
+        total_text = " ".join(insights)
+        words = total_text.split()
+        if len(words) > max_words:
+            total_text = " ".join(words[:max_words]).rstrip(" ,;:") + "."
+            insights = [_clean_text_output(total_text)]
+        
+        return insights if insights else [fallback]
+    except Exception:
+        return [fallback]
+
+
+def _clean_text_output(text):
+    """Clean up text for grammar, spacing, and formatting issues."""
+    import re
+    
+    # Remove multiple spaces
+    text = re.sub(r' +', ' ', text)
+    
+    # Fix spacing before punctuation
+    text = re.sub(r'\s+([.,;:!?])', r'\1', text)
+    
+    # Fix spacing after punctuation
+    text = re.sub(r'([.,;:!?])([A-Za-z])', r'\1 \2', text)
+    
+    # Remove duplicate consecutive words (case-insensitive)
+    text = re.sub(r'\b(\w+)\s+\1\b', r'\1', text, flags=re.IGNORECASE)
+    
+    # Ensure sentences end with proper punctuation
+    lines = text.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        line = line.strip()
+        if line and not line[-1] in '.!?':
+            line += '.'
+        cleaned_lines.append(line)
+    text = '\n'.join(cleaned_lines)
+    
+    # Capitalize first letter of sentences
+    text = re.sub(r'(^|[.!?]\s+)([a-z])', lambda m: m.group(1) + m.group(2).upper(), text)
+    
+    # Fix common run-on issues (missing space after period)
+    text = re.sub(r'\.([A-Z])', r'. \1', text)
+    
+    return text.strip()
+
+
+def _solution_item_insight(theme, concept, share):
+    return (
+        f"Insight: This solution reflects a practical response under '{theme}', and contributes "
+        f"{share:.1f}% of the proposed actions in this theme."
+    )
+
+
 THEME_KNOWLEDGE_BASE = """
 1. Poverty and Economic Barriers
 2. Legal Document-linked Barriers
@@ -128,16 +300,28 @@ def refine_concepts_with_ai(concepts_list, type_label):
     Uses AI to clean, deduplicate, and re-theme the top concepts.
     Returns a dictionary: { 'Old Concept': {'concept': 'New Concept', 'theme': 'New Theme'} }
     """
-    if not claude_client: return {}
-    
+    if not llm_provider:
+        return {}
+
+    checkpoint_path = get_refinement_checkpoint_path(type_label)
+    all_results = load_refinement_checkpoint(checkpoint_path)
+    pending_concepts = [concept for concept in concepts_list if concept not in all_results]
+
     print(f"   🧠 AI Refinement: Optimizing top {len(concepts_list)} {type_label}s...")
-    
-    all_results = {}
+    if all_results:
+        print(f"      ♻️ Resume mode: loaded {len(all_results)} cached refinements from {checkpoint_path}")
+
+    if not pending_concepts:
+        print(f"      ✅ No pending refinement for {type_label}. Using cached results.")
+        return all_results
+
     batch_size = 50
-    
-    for i in range(0, len(concepts_list), batch_size):
-        batch = concepts_list[i:i+batch_size]
-        print(f"      Processing batch {i//batch_size + 1} ({len(batch)} items)...")
+
+    total_batches = (len(pending_concepts) + batch_size - 1) // batch_size
+    for i in range(0, len(pending_concepts), batch_size):
+        batch = pending_concepts[i:i+batch_size]
+        current_batch = (i // batch_size) + 1
+        print(f"      Processing batch {current_batch}/{total_batches} ({len(batch)} items)...")
         
         prompt = f"""You are a Data Cleaning Expert for an Education Report.
         
@@ -171,30 +355,36 @@ def refine_concepts_with_ai(concepts_list, type_label):
         }}
         RETURN ONLY JSON. NO MARKDOWN."""
 
-        try:
-            response = claude_client.invoke_model(
-                modelId=MODEL_ID,
-                body=json.dumps({
-                    "anthropic_version": "bedrock-2023-05-31",
-                    "max_tokens": 4000,
-                    "messages": [{"role": "user", "content": prompt}]
-                })
-            )
-            resp_body = json.loads(response['body'].read())
-            text = resp_body['content'][0]['text'].strip()
-            
-            # Robust JSON extraction
-            json_match = re.search(r'\{.*\}', text, re.DOTALL)
-            if json_match:
-                text = json_match.group(0)
-            else:
-                text = text.replace('```json', '').replace('```', '').strip()
-                
-            batch_result = json.loads(text)
-            all_results.update(batch_result)
-            
-        except Exception as e:
-            print(f"      ⚠️ Batch {i//batch_size + 1} Failed: {e}")
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                text = llm_provider.generate_text(prompt, max_tokens=4000, temperature=0)
+
+                json_match = re.search(r'\{.*\}', text, re.DOTALL)
+                if json_match:
+                    text = json_match.group(0)
+                else:
+                    text = text.replace('```json', '').replace('```', '').strip()
+
+                batch_result = json.loads(text)
+                all_results.update(batch_result)
+                save_refinement_checkpoint(checkpoint_path, all_results)
+                print(f"      ✅ Batch {current_batch} saved ({len(batch_result)} items).")
+                break
+
+            except Exception as error:
+                retryable = is_retryable_error(error)
+                should_retry = retryable and attempt < MAX_RETRIES
+                print(f"      ⚠️ Batch {current_batch} attempt {attempt}/{MAX_RETRIES} failed: {error}")
+
+                if should_retry:
+                    delay = min(MAX_RETRY_SECONDS, BASE_RETRY_SECONDS * (2 ** (attempt - 1)))
+                    delay += random.uniform(0, 0.5)
+                    print(f"      🔁 Retrying in {delay:.1f}s...")
+                    time.sleep(delay)
+                    continue
+
+                print(f"      ❌ Batch {current_batch} failed after {attempt} attempt(s).")
+                break
             
     return all_results
 
@@ -626,7 +816,23 @@ def generate_report():
             p.paragraph_format.first_line_indent = Pt(-18)
             p.add_run(f"{i}. {concept}").bold = True
             p.add_run(f" ({count} mentions, {item_perc:.1f}%)")
-            p.add_run(f"\n   Voice from the ground: \"{rep_quote}\"").italic = True
+
+            # Get insight paragraphs (2-3 paragraphs, max 150 words total) - analyze actual voices
+            insight_paragraphs = _challenge_item_insight(theme, concept, item_perc, count, t_c, t_s, original_texts, max_words=150)
+            
+            # If quote is short (< 100 chars), use only first insight paragraph
+            quote_length = len(rep_quote) if rep_quote else 0
+            paragraphs_to_show = insight_paragraphs[:1] if quote_length < 100 else insight_paragraphs
+            
+            # Add insight paragraphs
+            for insight_text in paragraphs_to_show:
+                insight_para = doc.add_paragraph()
+                insight_para.paragraph_format.left_indent = Pt(54)
+                insight_para.add_run(insight_text)
+
+            quote_para = doc.add_paragraph()
+            quote_para.paragraph_format.left_indent = Pt(54)
+            quote_para.add_run(f"Voice from the ground: \"{rep_quote}\"").italic = True
             
             if coverage_perc >= 50 and i >= 5: # At least 5 items, or until 50%
                 break

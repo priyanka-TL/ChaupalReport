@@ -78,7 +78,18 @@ Core logic:
 
 ```text
 Act as an expert Social Data Analyst. Use these THEMES:
-[theme knowledge base]
+
+1. Poverty and Economic Barriers: Financial hardship, child labour. Keywords: Poor, no money.
+2. Legal Document-linked Barriers: Missing Aadhaar, birth certificates. Keywords: No Aadhar, no ID.
+3. Child Marriage Issue: Early marriage preventing education. Keywords: Child marriage.
+4. Distance and Accessibility Issues: School far, bad roads, weather. Keywords: Far, no bus, rain.
+5. Parental Attitudes & Socio-Cultural: Mindsets against girls, dowry, domestic roles.
+6. School Infrastructure & Facility: Toilets, water, Mid-day meals, books, govt schemes.
+7. Teacher Capacity & Quality: Shortage of teachers, irregular attendance.
+8. Safety Issues: Harassment, unsafe routes, stray dogs.
+9. Substance Abuse & Addiction: Alcohol, drugs, gambling, mobile addiction.
+10. Other Factors: General awareness, migration. (Target <10%)
+
 
 SEMANTIC DEDUPLICATION PROTOCOL (MANDATORY):
 You must merge semantically similar items into a single "Merged_Concept".
@@ -129,7 +140,18 @@ AI refinement layer:
 You are a Data Cleaning Expert for an Education Report.
 
 THEMES:
-[theme knowledge base]
+"""
+1. Poverty and Economic Barriers: Financial hardship, child labour. Keywords: Poor, no money.
+2. Legal Document-linked Barriers: Missing Aadhaar, birth certificates. Keywords: No Aadhar, no ID.
+3. Child Marriage Issue: Early marriage preventing education. Keywords: Child marriage.
+4. Distance and Accessibility Issues: School far, bad roads, weather. Keywords: Far, no bus, rain.
+5. Parental Attitudes & Socio-Cultural: Mindsets against girls, dowry, domestic roles.
+6. School Infrastructure & Facility: Toilets, water, Mid-day meals, books, govt schemes.
+7. Teacher Capacity & Quality: Shortage of teachers, irregular attendance.
+8. Safety Issues: Harassment, unsafe routes, stray dogs.
+9. Substance Abuse & Addiction: Alcohol, drugs, gambling, mobile addiction.
+10. Other Factors: General awareness, migration. (Target <10%)
+"""
 
 INPUT: A list of top recurring [Challenge/Solution]s found in the data.
 
