@@ -850,21 +850,14 @@ def generate_report():
             doc.add_paragraph(f"Communities proposed {total_theme_sol:,} solutions to address this theme. The solution ecosystem demonstrates {agency_main} agency with {agency_perc:.1f}% of solutions being {agency_main}.")
 
             doc.add_heading("Most Frequently Proposed Solutions", level=5)
-            
-            # Logic for 50% coverage - Solutions
-            sol_counts = t_s['Merged_Concept'].value_counts()
-            cumulative_count_s = 0
-            printed_count = 0
-            
-            for concept, count in sol_counts.items():
-                if not is_valid_solution(concept):
-                    continue
 
-                printed_count += 1
-                cumulative_count_s += count
-                coverage_perc = (cumulative_count_s / total_theme_sol) * 100
+            # Keep only top 5 solutions by highest mentions
+            sol_counts = t_s['Merged_Concept'].value_counts()
+            top_solutions = [(concept, count) for concept, count in sol_counts.items() if is_valid_solution(concept)][:5]
+
+            for rank, (concept, count) in enumerate(top_solutions, 1):
                 item_perc = (count / total_theme_sol) * 100
-                
+
                 # Find representative quote
                 original_texts = t_s[t_s['Merged_Concept'] == concept]['Solutions'].tolist()
                 rep_quote = max(original_texts, key=len) if original_texts else concept
@@ -872,14 +865,9 @@ def generate_report():
                 p = doc.add_paragraph()
                 p.paragraph_format.left_indent = Pt(36)
                 p.paragraph_format.first_line_indent = Pt(-18)
-                p.add_run(f"{printed_count}. {concept}").bold = True
+                p.add_run(f"{rank}. {concept}").bold = True
                 p.add_run(f" ({count} mentions, {item_perc:.1f}%)")
                 p.add_run(f"\n   Community Proposal: \"{rep_quote}\"").italic = True
-                
-                if coverage_perc >= 50 and printed_count >= 5:
-                    break
-                if printed_count >= 15:
-                    break
 
     doc.add_page_break()
     print("   📝 Generating Section 5: District Profiles...")
