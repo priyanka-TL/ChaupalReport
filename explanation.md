@@ -78,7 +78,6 @@ Core logic:
 
 ```text
 Act as an expert Social Data Analyst. Use these THEMES:
-
 1. Poverty and Economic Barriers: Financial hardship, child labour. Keywords: Poor, no money.
 2. Legal Document-linked Barriers: Missing Aadhaar, birth certificates. Keywords: No Aadhar, no ID.
 3. Child Marriage Issue: Early marriage preventing education. Keywords: Child marriage.
@@ -90,23 +89,41 @@ Act as an expert Social Data Analyst. Use these THEMES:
 9. Substance Abuse & Addiction: Alcohol, drugs, gambling, mobile addiction.
 10. Other Factors: General awareness, migration. (Target <10%)
 
-
 SEMANTIC DEDUPLICATION PROTOCOL (MANDATORY):
 You must merge semantically similar items into a single "Merged_Concept".
 
 Rules:
 1. Group all variants expressing the same core issue.
-2. Select the most complete and descriptive version as the canonical form for 'Merged_Concept'.
+2. Select ONE canonical phrase and reuse it for all equivalent variants in this batch.
+2A. Before writing output, internally create a canonical dictionary for this batch.
+2B. Use only those dictionary labels in final output (no one-off labels for similar meaning).
+3. 'Merged_Concept' MUST follow canonical naming format:
+   - concise noun phrase (3-8 words)
+   - no ending punctuation
+   - avoid sentence-style wording
+   - avoid district/person-specific details
+   - stable wording across similar records
 3. Examples of merging:
-	 - "Due to poverty" = "Due to poor financial condition" = "Lack of money" -> Merged_Concept: "Poverty preventing education"
-	 - "No Aadhaar card" = "Lack of Aadhaar" = "Aadhaar not made" -> Merged_Concept: "Lack of legal documentation (Aadhaar)"
-	 - "School is far" = "School is very far" = "Distance of school" -> Merged_Concept: "School distance and accessibility issues"
+   - "Due to poverty" = "Due to poor financial condition" = "Lack of money" -> Merged_Concept: "Poverty preventing education"
+   - "No Aadhaar card" = "Lack of Aadhaar" = "Aadhaar not made" -> Merged_Concept: "Lack of legal documentation (Aadhaar)"
+   - "School is far" = "School is very far" = "Distance of school" -> Merged_Concept: "School distance and accessibility issues"
+   - "We will drop children to school" = "Arranging transport to school" = "Parents will take children to school" -> Merged_Concept: "Community-supported school transportation"
 4. CRITICAL: Assign EXACTLY ONE theme from the list. Do not combine themes with '+' or 'and'. If multiple apply, choose the most dominant one.
 
-TASK: Categorize these unique [Challenge/Solution] statements.
+TASK: Categorize these unique {type_label} statements.
+SELF-CHECK (MANDATORY, still same single call):
+- Re-scan your own output and ensure semantically equivalent rows use exactly identical Merged_Concept text.
+- If two labels differ only by wording (e.g., arranging/providing/facilitating same action), unify them.
 OUTPUT: Return ONLY a CSV-style format with three columns: Original|Theme|Merged_Concept
 Use the | character as the delimiter. Do not include headers, preamble, or markdown backticks.
+
+DATA:
+{text_batch}
 ```
+
+**Runtime Variables:**
+- `{type_label}`: "Challenge" or "Solution"
+- `{text_batch}`: Batch of unique statements to categorize
 
 Why this matters: this step creates the thematic backbone used by all section tables and narratives.
 
@@ -134,13 +151,14 @@ AI refinement layer:
 - Sends them for additional deduplication + re-theming.
 - Applies returned updates to improve conceptual consistency.
 
-#### Prompt Used in `3_final_processor.py` (Refinement)
+#### Prompts Used in `3_final_processor.py`
+
+**A. Refinement Prompt (Aggressive Deduplication)**
 
 ```text
 You are a Data Cleaning Expert for an Education Report.
 
 THEMES:
-"""
 1. Poverty and Economic Barriers: Financial hardship, child labour. Keywords: Poor, no money.
 2. Legal Document-linked Barriers: Missing Aadhaar, birth certificates. Keywords: No Aadhar, no ID.
 3. Child Marriage Issue: Early marriage preventing education. Keywords: Child marriage.
@@ -151,22 +169,115 @@ THEMES:
 8. Safety Issues: Harassment, unsafe routes, stray dogs.
 9. Substance Abuse & Addiction: Alcohol, drugs, gambling, mobile addiction.
 10. Other Factors: General awareness, migration. (Target <10%)
-"""
 
-INPUT: A list of top recurring [Challenge/Solution]s found in the data.
+INPUT: A list of top recurring {type_label}s found in the data.
 
 TASKS:
 1. AGGRESSIVE DEDUPLICATION: Merge specific variants into broader core concepts.
-	 - "Child labor in agriculture" / "Child labor at home" / "Child labour due to poverty" / "Child labour preventing education" -> "Child Labour"
-	 - "Poverty preventing girls' education" / "Poverty preventing school attendance" / "Poverty preventing children's education" -> "Poverty preventing education"
-	 - "Lack of awareness" / "General awareness" -> "Lack of awareness about education importance"
+   - "Child labor in agriculture" / "Child labor at home" / "Child labour due to poverty" / "Child labour preventing education" -> MERGE ALL INTO "Child Labour"
+   - "Poverty preventing girls' education" / "Poverty preventing school attendance" / "Poverty preventing children's education" -> MERGE ALL INTO "Poverty preventing education"
+   - "Lack of awareness" / "General awareness" -> MERGE INTO "Lack of awareness about education importance"
 2. RE-THEME: Correct misclassified items.
-3. FORMAT: Ensure the concept is a clear, concise [Challenge/Solution] statement.
+3. FORMAT: Ensure the concept is a clear, concise {type_label} statement.
+
+INPUT LIST:
+{json.dumps(batch)}
 
 OUTPUT:
-Return a VALID JSON object where keys are input strings and values are objects with "concept" and "theme".
+Return a VALID JSON object where keys are the INPUT strings and values are objects with "concept" and "theme".
+IMPORTANT: 
+- Escape all double quotes within strings (e.g., \"text\").
+- Do not include any text outside the JSON block.
+- Ensure the JSON is valid.
+
+Example:
+{
+    "Child labor in agriculture": {"concept": "Child Labour", "theme": "Poverty and Economic Barriers"},
+    "General awareness": {"concept": "Lack of awareness about education importance", "theme": "Other Factors"}
+}
 RETURN ONLY JSON. NO MARKDOWN.
 ```
+
+**Runtime Variables:**
+- `{THEME_KNOWLEDGE_BASE}`: Full theme list
+- `{type_label}`: "Challenge" or "Solution"
+- `{batch}`: List of merged concepts to refine
+
+---
+
+**B. JSON Repair Prompt (Fallback for Malformed Responses)**
+
+```text
+Fix the malformed JSON below.
+
+RULES:
+1. Return ONLY valid JSON object.
+2. Keys must come from this input list: {json.dumps(batch, ensure_ascii=False)}
+3. Each value must be an object with keys: concept, theme.
+4. Keep meaning intact. Do not add extra text.
+
+MALFORMED JSON/TEXT:
+{raw_text}
+
+OUTPUT: valid JSON object only.
+```
+
+**Runtime Variables:**
+- `{batch}`: Original input list
+- `{raw_text}`: Malformed JSON response from previous AI call
+
+---
+
+**C. Challenge Insight Generation Prompt**
+
+```text
+You are analyzing on-ground education barriers from grassroots dialogue data.
+
+ANALYZE THESE ACTUAL GROUND SCENARIOS:
+{scenarios_text}
+
+CONTEXT:
+- Theme: {theme}
+- Number of similar cases: {count} ({share:.1f}% of theme)
+- Geographic spread: {districts} district(s)
+- Primary setting: {env_text}
+
+TASK:
+Write 2-3 DISTINCT, NON-REPETITIVE insights that reveal the BROADER PICTURE of what's happening on the ground.
+
+EACH INSIGHT MUST COVER A DIFFERENT DIMENSION:
+✓ Insight 1: What MECHANISM/TRIGGER causes this barrier? (e.g., sudden economic shocks, rigid documentation rules, infrastructure gaps)
+✓ Insight 2: WHO is most affected and WHAT cascading effects occur? (e.g., girls withdrawn first, entire families pulled out, seasonal disruptions)
+✓ Insight 3 (if needed): What SYSTEMIC PATTERN or broader implication emerges? (e.g., policy-implementation gaps, urban-rural divide, poverty multipliers)
+
+CRITICAL REQUIREMENTS:
+✗ NO repetition - each sentence must add NEW information, not rephrase the same point
+✗ NO generic statements like "barriers impede access" or "factors prevent education"
+✗ NO explicit references to "voices," "testimonials," or "participants said"
+✗ NO repetition of the challenge concept name (it's in the heading above)
+✓ Be CONCRETE and SPECIFIC about mechanisms, triggers, affected groups, cascading effects
+✓ Synthesize the BROADER PICTURE from multiple scenarios - what patterns emerge?
+✓ Each insight should answer a DIFFERENT question about the challenge
+✓ Use PERFECT grammar, spelling, and punctuation - proofread carefully
+✓ Write in complete, well-structured sentences with proper syntax
+
+EXAMPLE OF NON-REPETITIVE INSIGHTS:
+❌ BAD (repetitive): "Rigid enforcement blocks children. Inflexibility disqualifies students."
+✅ GOOD (distinct dimensions): "Minor documentation discrepancies trigger automatic rejection during enrollment. Marginalized families—lacking digital literacy or correction mechanisms—face permanent exclusion, with no appeals process available."
+
+WORD LIMIT: Maximum 100 words total.
+
+OUTPUT: Return 2-3 distinct, non-overlapping, grammatically perfect insight sentences. Separate with double newlines.
+```
+
+**Runtime Variables:**
+- `{scenarios_text}`: Sample of actual challenge statements
+- `{theme}`: Theme name
+- `{concept}`: Merged concept name
+- `{share}`: Percentage of theme challenges
+- `{count}`: Number of occurrences
+- `{districts}`: Number of districts reporting
+- `{env_text}`: Primary environment (School/Home/Community)
 
 ---
 
