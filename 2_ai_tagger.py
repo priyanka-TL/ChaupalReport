@@ -100,43 +100,111 @@ def postprocess_mapping_batch(df_batch):
     df_batch = df_batch.drop_duplicates(subset=['Original'], keep='last')
     return df_batch
 
-def get_ai_mapping(text_batch, type_label):
+
+def _get_existing_labels(output_csv):
+    """Collect unique Merged_Concept labels from already-processed batches for cross-batch consistency."""
+    if not os.path.exists(output_csv):
+        return []
+    try:
+        df = pd.read_csv(output_csv)
+        if 'Merged_Concept' in df.columns:
+            # Return most frequent labels first (higher priority for reuse)
+            return df['Merged_Concept'].dropna().value_counts().index.tolist()
+    except Exception:
+        pass
+    return []
+
+
+def get_ai_mapping(text_batch, type_label, existing_labels=None):
     if not llm_provider:
         raise RuntimeError("LLM provider is not configured")
 
-    prompt_content = f"""Act as an expert Social Data Analyst. Use these THEMES:
-    {THEME_KNOWLEDGE_BASE}
-    
-    SEMANTIC DEDUPLICATION PROTOCOL (MANDATORY):
-    You must merge semantically similar items into a single "Merged_Concept".
-    
-     Rules:
-    1. Group all variants expressing the same core issue.
-    2. Select ONE canonical phrase and reuse it for all equivalent variants in this batch.
-    2A. Before writing output, internally create a canonical dictionary for this batch.
-    2B. Use only those dictionary labels in final output (no one-off labels for similar meaning).
-     3. 'Merged_Concept' MUST follow canonical naming format:
-         - concise noun phrase (3-8 words)
-         - no ending punctuation
-         - avoid sentence-style wording
-         - avoid district/person-specific details
-         - stable wording across similar records
-    3. Examples of merging:
-       - "Due to poverty" = "Due to poor financial condition" = "Lack of money" -> Merged_Concept: "Poverty preventing education"
-       - "No Aadhaar card" = "Lack of Aadhaar" = "Aadhaar not made" -> Merged_Concept: "Lack of legal documentation (Aadhaar)"
-       - "School is far" = "School is very far" = "Distance of school" -> Merged_Concept: "School distance and accessibility issues"
-         - "We will drop children to school" = "Arranging transport to school" = "Parents will take children to school" -> Merged_Concept: "Community-supported school transportation"
-     4. CRITICAL: Assign EXACTLY ONE theme from the list. Do not combine themes with '+' or 'and'. If multiple apply, choose the most dominant one.
-    
-    TASK: Categorize these unique {type_label} statements.
-    SELF-CHECK (MANDATORY, still same single call):
-    - Re-scan your own output and ensure semantically equivalent rows use exactly identical Merged_Concept text.
-    - If two labels differ only by wording (e.g., arranging/providing/facilitating same action), unify them.
-    OUTPUT: Return ONLY a CSV-style format with three columns: Original|Theme|Merged_Concept
-    Use the | character as the delimiter. Do not include headers, preamble, or markdown backticks.
-    
-    DATA:
-    {text_batch}"""
+    # Build existing labels context for cross-batch consistency
+    existing_labels_section = ""
+    if existing_labels:
+        labels_to_show = existing_labels[:200]  # Cap to prevent prompt bloat
+        labels_formatted = "\n".join(f"  • {label}" for label in labels_to_show)
+        existing_labels_section = f"""
+════════════════════════════════════════
+EXISTING CANONICAL LABELS (MUST REUSE)
+════════════════════════════════════════
+Previous batches have already established these Merged_Concept labels.
+If ANY input statement below describes the SAME concept as an existing label,
+you MUST use that EXACT existing label string. DO NOT invent a new synonym.
+
+{labels_formatted}
+"""
+
+    prompt_content = f"""Act as an expert Social Data Analyst for an Education Report. Use EXACTLY these THEMES:
+{THEME_KNOWLEDGE_BASE}
+
+════════════════════════════════════════
+STEP 1 — READ ALL INPUT FIRST (mandatory)
+════════════════════════════════════════
+Before writing a single line of output, read every statement in the DATA section.
+Build a mental canonical dictionary: one label per unique concept.
+
+════════════════════════════════════════
+STEP 2 — APPLY UNIVERSAL MERGE PRINCIPLES
+════════════════════════════════════════
+Two statements MUST get the IDENTICAL Merged_Concept if they pass ANY of these tests:
+
+  PRINCIPLE 1 — Same root word, different form
+    Any noun / verb / adjective / gerund transformation of the same root = same concept.
+    "Teacher absenteeism" = "Teachers being absent" = "Absent teachers" = "Teachers not coming"
+    "Child marriage" = "Early marriage of children" = "Children getting married early"
+
+  PRINCIPLE 2 — Synonyms or paraphrases of the same idea
+    Replace any word with its synonym and the meaning is unchanged = same concept.
+    "Parents don't value education" = "Parents devaluing education" = "Low parental value for education"
+    = "Parental indifference to education" = "Parents not prioritizing schooling"
+
+  PRINCIPLE 3 — Same barrier expressed as cause OR effect
+    "X preventing Y" = "Lack of X" = "No X" = "X as a barrier to Y" = "Y affected by X"
+    "Poverty preventing education" = "No money for school" = "Financial hardship blocking education"
+
+  PRINCIPLE 4 — Same action, different subject emphasis
+    "Children doing domestic chores" = "Domestic chores keeping children home"
+    = "Household work preventing school attendance" = "Girls doing housework instead of studying"
+
+  PRINCIPLE 5 — Qualifier variants that don't change the root issue
+    Adding/removing words like "frequent", "irregular", "low", "poor", "lack of", "limited"
+    does not create a new concept if the core issue is the same.
+    "Irregular attendance" = "Low attendance" = "Poor school attendance" = "Frequent absenteeism"
+
+  PRINCIPLE 6 — Specific instance of a general pattern = same concept
+    A specific example of a barrier is still the same concept as its general form.
+    "School 5 km away" = "School is far" = "Long distance to school" = "School too far from home"
+
+ILLUSTRATIVE EXAMPLES (apply the principles above to ALL labels, not just these):
+  "Due to poverty" = "Poor financial condition" = "No money" → "Poverty preventing education"
+  "No Aadhaar" = "Aadhaar not made" = "Missing identity document" → "Lack of legal documentation (Aadhaar)"
+  "School is far" = "Distance of school" = "School far from village" → "School too far from home"
+  "Parents take children to school" = "Arranging school transport" → "Community-supported school transportation"
+
+DO NOT MERGE if the ROOT ISSUE is genuinely different (not just phrased differently):
+  "Poverty" ≠ "Child labour" | "Teacher shortage" ≠ "Teacher quality" | "Domestic chores" ≠ "Agricultural work"
+
+════════════════════════════════════════
+STEP 3 — FORMAT RULES
+════════════════════════════════════════
+  Merged_Concept: concise noun phrase, 3-8 words, no trailing punctuation,
+  no district/person-specific details, EXACT same string for all merged rows.
+  Theme: EXACTLY ONE from the list. Never combine with '+' or 'and'.
+
+════════════════════════════════════════
+STEP 4 — SELF-CHECK BEFORE OUTPUT
+════════════════════════════════════════
+  Scan all your Merged_Concept values. If any two mean the same thing, unify them NOW.
+  Ask yourself: "Could a reader mistake these two labels for the same issue?"
+  If yes → use one label.
+{existing_labels_section}
+TASK: Categorize these unique {type_label} statements.
+OUTPUT: Pipe-delimited rows only: Original|Theme|Merged_Concept
+No headers, no preamble, no markdown, no explanation.
+
+DATA:
+{text_batch}"""
 
     raw_output = llm_provider.generate_text(
         prompt_content,
@@ -187,9 +255,11 @@ def process_file(input_csv, output_csv, type_label):
         batch = "\n".join(current_items)
         mapped_df = pd.DataFrame()
 
+        existing_labels = _get_existing_labels(output_csv)
+
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                mapped_df = get_ai_mapping(batch, type_label)
+                mapped_df = get_ai_mapping(batch, type_label, existing_labels=existing_labels)
                 break
             except Exception as batch_error:
                 retryable = is_retryable_error(batch_error)

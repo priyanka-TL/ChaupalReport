@@ -38,12 +38,13 @@ MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "5"))
 BASE_RETRY_SECONDS = float(os.getenv("LLM_RETRY_BASE_SECONDS", "2"))
 MAX_RETRY_SECONDS = float(os.getenv("LLM_RETRY_MAX_SECONDS", "45"))
 REFINE_CHECKPOINT_DIR = os.getenv("REFINE_CHECKPOINT_DIR", ".")
-REFINE_BATCH_SIZE = int(os.getenv("REFINE_BATCH_SIZE", "25"))
+REFINE_BATCH_SIZE = int(os.getenv("REFINE_BATCH_SIZE", "30"))  # Moderate batch size for balanced deduplication
 REFINE_MAX_TOKENS = int(os.getenv("REFINE_MAX_TOKENS", "6000"))
 REFINE_THINKING_BUDGET = int(os.getenv("REFINE_THINKING_BUDGET", "256"))
 INSIGHT_MAX_TOKENS = int(os.getenv("INSIGHT_MAX_TOKENS", "900"))
 INSIGHT_THINKING_BUDGET = int(os.getenv("INSIGHT_THINKING_BUDGET", "256"))
 INSIGHT_TEMPERATURE = float(os.getenv("INSIGHT_TEMPERATURE", "0.15"))
+SEMANTIC_DEDUP_BATCH_SIZE = int(os.getenv("SEMANTIC_DEDUP_BATCH_SIZE", "60"))  # Per-theme semantic dedup batch
 
 
 def is_retryable_error(error):
@@ -206,6 +207,10 @@ def clean_theme_name(text):
         
     # Remove leading numbers/bullets (e.g., "1. Poverty")
     text = re.sub(r'^\d+[\.\)\s-]*', '', text).strip()
+
+    # Normalize case to Title Case to prevent theme splits due to casing
+    # e.g. 'Child Marriage Issue' vs 'Child marriage Issue'
+    text = text.title()
     
     return text
 
@@ -278,6 +283,42 @@ def _soft_token_overlap(tokens_a, tokens_b):
     return overlap
 
 
+def _subject_token(text):
+    """Extract the first meaningful (non-stopword, non-connector) stemmed token
+    from the original phrase order. This is the 'subject' of the concept —
+    the part that distinguishes 'Child marriage ...' from 'Poverty ...'
+    without any hardcoded domain vocabulary."""
+    _stopwords_ext = {
+        'a', 'an', 'the', 'and', 'or', 'of', 'to', 'for', 'in', 'on', 'at', 'by',
+        'with', 'from', 'is', 'are', 'was', 'were', 'be', 'being', 'this', 'that',
+        'as', 'due', 'its', 'it',
+        # Generic connector verbs/nouns that appear in many concepts as trailing words
+        'prevent', 'preventing', 'barrier', 'barriers', 'issue', 'issues',
+        'cause', 'causing', 'affect', 'affecting', 'hinder', 'hindering',
+        'stop', 'stopping', 'impact', 'impacting', 'lead', 'leading',
+    }
+    for word in str(text).split():
+        w = word.strip().lower()
+        if not w or w in _stopwords_ext:
+            continue
+        # Apply same stemming as _tokenize_concept_key
+        if w.endswith('ation') and len(w) > 7:
+            w = w[:-5]
+        elif w.endswith('tion') and len(w) > 6:
+            w = w[:-4]
+        if w.endswith('ing') and len(w) > 5:
+            w = w[:-3]
+        elif w.endswith('ed') and len(w) > 4:
+            w = w[:-2]
+        elif w.endswith('es') and len(w) > 4:
+            w = w[:-2]
+        elif w.endswith('s') and len(w) > 3:
+            w = w[:-1]
+        if w and w not in _stopwords_ext:
+            return w
+    return ""
+
+
 def _are_concepts_similar(key_a, key_b):
     if not key_a or not key_b:
         return False
@@ -298,7 +339,29 @@ def _are_concepts_similar(key_a, key_b):
     overlap = soft_intersection / min(len(tokens_a), len(tokens_b))
     seq_ratio = SequenceMatcher(None, key_a, key_b).ratio()
 
-    return (overlap >= 0.6 and jaccard >= 0.34) or seq_ratio >= 0.84
+    # Subject-anchor guard (no hardcoded domain words):
+    # Extract the first meaningful word of each concept in original phrase order.
+    # "Child marriage as a barrier..." → subject = "child"
+    # "Poverty as a barrier..."       → subject = "poverty"
+    # If both concepts have 3+ tokens and subjects share < 0.7 char similarity,
+    # they are different topics regardless of their shared tail phrase.
+    subject_sim = 0.0
+    if len(tokens_a) >= 3 and len(tokens_b) >= 3:
+        subj_a = _subject_token(key_a)
+        subj_b = _subject_token(key_b)
+        if subj_a and subj_b:
+            subject_sim = SequenceMatcher(None, subj_a, subj_b).ratio()
+            if subject_sim < 0.70:
+                return False
+
+    # When subjects are identical/very close, allow slightly looser overlap threshold
+    # to catch same-topic concepts with different phrasing (e.g. "weather conditions
+    # preventing school attendance" vs "weather-related barriers to attendance")
+    if subject_sim >= 0.90:
+        return (overlap >= 0.45 and jaccard >= 0.25) or seq_ratio >= 0.88
+
+    # Standard threshold for concepts where subjects are related but not identical
+    return (overlap >= 0.6 and jaccard >= 0.40) or seq_ratio >= 0.88
 
 
 def assign_concept_groups(df, concept_column='Merged_Concept'):
@@ -533,36 +596,85 @@ def refine_concepts_with_ai(concepts_list, type_label):
         print(f"      Processing batch {current_batch}/{total_batches} ({len(batch)} items)...")
         
         prompt = f"""You are a Data Cleaning Expert for an Education Report.
-        
-        THEMES:
-        {THEME_KNOWLEDGE_BASE}
-        
-        INPUT: A list of top recurring {type_label}s found in the data.
-        
-        TASKS:
-        1. AGGRESSIVE DEDUPLICATION: Merge specific variants into broader core concepts.
-           - "Child labor in agriculture" / "Child labor at home" / "Child labour due to poverty" / "Child labour preventing education" -> MERGE ALL INTO "Child Labour"
-           - "Poverty preventing girls' education" / "Poverty preventing school attendance" / "Poverty preventing children's education" -> MERGE ALL INTO "Poverty preventing education"
-           - "Lack of awareness" / "General awareness" -> MERGE INTO "Lack of awareness about education importance"
-        2. RE-THEME: Correct misclassified items.
-        3. FORMAT: Ensure the concept is a clear, concise {type_label} statement.
-        
-        INPUT LIST:
-        {json.dumps(batch)}
-        
-        OUTPUT:
-        Return a VALID JSON object where keys are the INPUT strings and values are objects with "concept" and "theme".
-        IMPORTANT: 
-        - Escape all double quotes within strings (e.g., \"text\").
-        - Do not include any text outside the JSON block.
-        - Ensure the JSON is valid.
-        
-        Example:
-        {{
-            "Child labor in agriculture": {{"concept": "Child Labour", "theme": "Poverty and Economic Barriers"}},
-            "General awareness": {{"concept": "Lack of awareness about education importance", "theme": "Other Factors"}}
-        }}
-        RETURN ONLY JSON. NO MARKDOWN."""
+
+THEMES:
+{THEME_KNOWLEDGE_BASE}
+
+CONTEXT: This input list contains canonical {type_label} labels generated by an AI across SEPARATE
+batches. The SAME concept frequently received DIFFERENT labels in different batches. Your job is
+to collapse ALL such variants into one canonical label per concept.
+
+════════════════════════════════════════
+UNIVERSAL MERGE PRINCIPLES (apply to ANY label, not just examples)
+════════════════════════════════════════
+Two labels MUST be merged if they satisfy ANY of these:
+
+  P1 — Root-word equivalence
+      Any noun/verb/adjective/gerund form of the same root = same concept.
+      "Teacher absenteeism" = "Absent teachers" = "Teachers not attending" = "Irregular teacher attendance"
+
+  P2 — Synonym / paraphrase equivalence
+      Replacing any word with a synonym leaves the meaning unchanged = same concept.
+      "Low parental value for education" = "Parents devaluing education" = "Parental indifference to education"
+      = "Parents not prioritizing schooling" = "Lack of parental interest in children's education"
+
+  P3 — Cause / effect / barrier framing of the same phenomenon
+      "X preventing Y" = "Y due to X" = "Lack of X" = "No X" = "X as a barrier"
+      "Poverty preventing education" = "No money for school" = "Economic hardship blocking attendance"
+
+  P4 — Subject-emphasis variants of the same action
+      Shifting who is described (child vs. parent vs. school) for the same action = same concept.
+      "Children doing domestic chores" = "Domestic chores keeping children home" = "Girls doing housework"
+
+  P5 — Qualifier variants that don't change the core issue
+      Adding/removing "frequent", "irregular", "low", "poor", "lack of", "limited", "inadequate" alone
+      does not create a new concept.
+      "Irregular attendance" = "Low attendance" = "Poor school attendance" = "Frequent absenteeism"
+
+  P6 — Specific instance vs. general form
+      A specific elaboration of the same barrier = same concept.
+      "School 5 km from village" = "School far from home" = "Long distance to school"
+
+DO NOT MERGE — keep as separate concepts when:
+  • They describe genuinely different root causes (even if related)
+    "Poverty" ≠ "Child labour" (child labour is a consequence of poverty, not the same)
+    "Teacher shortage" ≠ "Teacher quality" (different issues)
+  • One is a sub-type or specific form of the other (preserve the detail!)
+    "Elopement" ≠ "Child marriage" (elopement is one form, keep both)
+    "Child labour in agriculture" ≠ "Child labour due to poverty" (keep specific types)
+    "Dropping out after primary" ≠ "Dropping out after middle school" (different stages)
+  • One is a cause and the other is a completely different consequence
+    "Substance abuse" ≠ "Domestic violence" (vice ≠ crime)
+  • They represent fundamentally different stakeholder actions
+    "School distance" ≠ "Lack of transport" (geography ≠ service)
+
+IMPORTANT: When in doubt, keep concepts SEPARATE. The report needs rich detail,
+not over-simplified categories. It is better to have two similar items than to lose
+important detail by merging things that are related but distinct.
+
+════════════════════════════════════════
+FORMAT FOR CANONICAL LABELS
+════════════════════════════════════════
+  - Concise noun phrase, 3-8 words, no trailing punctuation
+  - EXACT identical string for every item in the same group
+  - Choose the most specific, descriptive label from the group
+
+INPUT LIST:
+{json.dumps(batch)}
+
+════════════════════════════════════════
+METHOD (follow in order)
+════════════════════════════════════════
+  1. Read ALL items.
+  2. For each item, ask: "Is there another item that describes the SAME underlying issue?"
+  3. Group variants of the same issue and assign ONE canonical label per group.
+  4. SELF-CHECK: verify each merge — are these really the same issue, or related but distinct?
+     If distinct, undo. But also check: did you miss any variants that should merge?
+  5. Write output.
+
+OUTPUT FORMAT:
+Valid JSON object. Keys = input strings. Values = {{"concept": "...", "theme": "..."}}
+RETURN ONLY VALID JSON. NO MARKDOWN. NO TEXT OUTSIDE JSON."""
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -601,7 +713,372 @@ def refine_concepts_with_ai(concepts_list, type_label):
             
     return all_results
 
-# --- MAIN ENGINE ---
+
+def _cross_batch_dedup(all_results, type_label):
+    """
+    After all refine batches complete, collect ONLY the unique canonical concept labels
+    that emerged and run one final AI pass on just those labels to collapse any that
+    landed on different-worded-but-same-meaning strings across different batches.
+    Processes in batches to handle large label sets reliably.
+    """
+    if not llm_provider or not all_results:
+        return all_results
+
+    canonical_labels = list({v['concept'] for v in all_results.values()
+                             if isinstance(v, dict) and v.get('concept')})
+    if len(canonical_labels) <= 1:
+        return all_results
+
+    print(f"      🔁 Cross-batch dedup: {len(canonical_labels)} unique canonical labels — checking for duplicates...")
+
+    # Process in batches of ~80 labels to keep JSON output reliable for Gemini
+    CROSS_DEDUP_BATCH = 80
+    full_label_map = {}
+    total_merged = 0
+
+    for batch_start in range(0, len(canonical_labels), CROSS_DEDUP_BATCH):
+        batch_labels = canonical_labels[batch_start:batch_start + CROSS_DEDUP_BATCH]
+        if len(batch_labels) <= 1:
+            for lbl in batch_labels:
+                full_label_map[lbl] = lbl
+            continue
+
+        batch_num = (batch_start // CROSS_DEDUP_BATCH) + 1
+        total_batches = (len(canonical_labels) + CROSS_DEDUP_BATCH - 1) // CROSS_DEDUP_BATCH
+
+        dedup_prompt = f"""You are a Data Cleaning Expert. The list below contains canonical {type_label} labels
+produced by an AI working in SEPARATE batches. Because batches never saw each other, the SAME concept
+frequently received DIFFERENT labels. Your job: identify all such duplicate labels and unify them.
+
+════════════════════════════════════════
+MERGE RULES
+════════════════════════════════════════
+MERGE any two labels that satisfy ANY of these:
+  P1 — Root-word equivalence (noun/verb/adjective/gerund forms of same root)
+  P2 — Synonym / paraphrase (replacing a word with its synonym keeps meaning)
+  P3 — Cause/effect/barrier framing of the same phenomenon
+  P4 — Subject-emphasis shift for the same action
+  P5 — Qualifier variants ("irregular"/"low"/"poor" alone don't create new concepts)
+  P6 — Specific elaboration of the same general barrier
+
+DO NOT MERGE if root issues genuinely differ:
+  "Poverty" ≠ "Child labour" | "Teacher shortage" ≠ "Teacher quality"
+
+INPUT LABELS:
+{json.dumps(batch_labels)}
+
+OUTPUT: JSON object mapping EVERY input label to its final canonical label.
+  - Unique labels map to themselves.
+  - All labels in the same group map to the EXACT same string.
+RETURN ONLY VALID JSON. NO MARKDOWN."""
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                text = llm_provider.generate_text(
+                    dedup_prompt,
+                    max_tokens=REFINE_MAX_TOKENS,
+                    temperature=0,
+                    thinking_budget=REFINE_THINKING_BUDGET,
+                )
+                label_map = json.loads(_extract_json_block(text))
+                if not isinstance(label_map, dict):
+                    raise ValueError("Expected dict")
+
+                for lbl in batch_labels:
+                    full_label_map[lbl] = label_map.get(lbl, lbl)
+
+                batch_merged = sum(1 for lbl in batch_labels if label_map.get(lbl, lbl) != lbl)
+                total_merged += batch_merged
+                if total_batches > 1:
+                    print(f"         Batch {batch_num}/{total_batches}: merged {batch_merged} duplicate(s).")
+                break
+
+            except Exception as e:
+                if attempt < MAX_RETRIES:
+                    time.sleep(BASE_RETRY_SECONDS * (2 ** (attempt - 1)))
+                    continue
+                print(f"      ⚠️ Cross-batch dedup batch {batch_num} failed: {e}. Skipping batch.")
+                for lbl in batch_labels:
+                    full_label_map.setdefault(lbl, lbl)
+                break
+
+    # Apply the full mapping to all_results
+    if full_label_map:
+        updated = {}
+        for original, data in all_results.items():
+            if not isinstance(data, dict):
+                updated[original] = data
+                continue
+            old_concept = data.get('concept', '')
+            new_concept = full_label_map.get(old_concept, old_concept)
+            updated[original] = {**data, 'concept': new_concept}
+
+        print(f"      ✅ Cross-batch dedup: merged {total_merged} duplicate label(s) total.")
+        return updated
+
+    return all_results
+
+def _semantic_dedup_per_theme(df, type_label):
+    """
+    After lexical consolidation, run a per-theme AI clustering pass to consolidate
+    concept labels into the minimum set of distinct real-world issues.
+    Uses iterative convergence — keeps running until no more merges happen.
+    """
+    if not llm_provider:
+        return df
+
+    MAX_ROUNDS = 3  # prevent infinite loops
+
+    for round_num in range(1, MAX_ROUNDS + 1):
+        themes = df['Theme'].unique()
+        all_frames = []
+        total_merges = 0
+
+        for theme in themes:
+            theme_df = df[df['Theme'] == theme].copy()
+            labels = theme_df['Merged_Concept'].value_counts()
+            unique_labels = labels.index.tolist()
+
+            if len(unique_labels) <= 2:
+                all_frames.append(theme_df)
+                continue
+
+            batch_size = SEMANTIC_DEDUP_BATCH_SIZE
+            full_label_map = {}
+
+            for batch_start in range(0, len(unique_labels), batch_size):
+                batch_labels = unique_labels[batch_start:batch_start + batch_size]
+                if len(batch_labels) <= 1:
+                    for lbl in batch_labels:
+                        full_label_map[lbl] = lbl
+                    continue
+
+                labels_with_counts = [f"- {lbl}  ({labels[lbl]} mentions)" for lbl in batch_labels]
+                labels_text = "\n".join(labels_with_counts)
+
+                prompt = f"""You are deduplicating {type_label.lower()} concept labels under theme "{theme}".
+
+GOAL: Merge ONLY labels that are linguistic duplicates — the SAME concept described with different words.
+
+MERGE ONLY when:
+• Two labels are paraphrases or rewordings of the EXACT SAME concept
+  e.g. "Lack of teachers" = "Teacher shortage" = "Insufficient teachers"
+  e.g. "Parents not valuing education" = "Low parental value for education"
+
+KEEP SEPARATE — do NOT merge:
+• A specific sub-type and its parent category
+  "Child labour" ≠ "Poverty" (child labour is a consequence of poverty, not the same thing)
+  "Elopement" ≠ "Child marriage" (elopement is one form, not the same as child marriage)
+  "Weather barriers" ≠ "School distance" (different barriers)
+  "Domestic violence" ≠ "Substance abuse" (related but different)
+• Concepts with different root causes, even if related
+• Concepts that need different interventions
+
+IMPORTANT: When in doubt, keep concepts SEPARATE. It is better to have
+two similar items than to lose important detail by over-merging.
+
+When merging, use the label with MORE mentions as the canonical label.
+
+INPUT LABELS:
+{labels_text}
+
+OUTPUT: JSON object mapping EVERY input label (without mention counts) to its canonical label.
+Only true duplicates share a canonical label. Everything else maps to itself.
+RETURN ONLY VALID JSON. NO MARKDOWN."""
+
+                for attempt in range(1, MAX_RETRIES + 1):
+                    try:
+                        response = llm_provider.generate_text(
+                            prompt,
+                            max_tokens=REFINE_MAX_TOKENS,
+                            temperature=0,
+                            thinking_budget=REFINE_THINKING_BUDGET,
+                        )
+                        parsed = json.loads(_extract_json_block(response))
+                        if not isinstance(parsed, dict):
+                            raise ValueError("Expected dict")
+
+                        for lbl in batch_labels:
+                            mapped = parsed.get(lbl, lbl)
+                            if mapped in labels.index:
+                                full_label_map[lbl] = mapped
+                            else:
+                                full_label_map[lbl] = lbl
+
+                        batch_merges = sum(1 for k, v in full_label_map.items() if k != v and k in batch_labels)
+                        if batch_merges:
+                            print(f"      ✅ Concept clustering [{theme}] round {round_num}: merged {batch_merges} label(s).")
+                        break
+
+                    except Exception as e:
+                        if attempt < MAX_RETRIES:
+                            time.sleep(BASE_RETRY_SECONDS * (2 ** (attempt - 1)))
+                            continue
+                        print(f"      ⚠️ Clustering failed for theme '{theme}': {e}. Skipping batch.")
+                        for lbl in batch_labels:
+                            full_label_map.setdefault(lbl, lbl)
+                        break
+
+            if full_label_map:
+                merges_in_theme = sum(1 for k, v in full_label_map.items() if k != v)
+                total_merges += merges_in_theme
+                theme_df['Merged_Concept'] = theme_df['Merged_Concept'].map(full_label_map).fillna(theme_df['Merged_Concept'])
+
+            all_frames.append(theme_df)
+
+        df = pd.concat(all_frames, ignore_index=True) if all_frames else df
+
+        if total_merges:
+            print(f"   🔗 Concept clustering ({type_label}) round {round_num}: {total_merges} label(s) merged.")
+        else:
+            print(f"   ✅ Concept clustering ({type_label}) round {round_num}: converged — no more merges.")
+            break
+
+    return df
+
+
+def _consolidate_cross_theme_concepts(df, type_label):
+    """
+    Fix cross-theme duplication:
+    Phase 1: Same label in 2+ themes → reassign all rows to dominant theme.
+    Phase 2: AI clustering across themes — find concepts under different themes
+             that are actually the same issue, merge them.
+    Runs iteratively until convergence.
+    """
+    # ── Phase 1: Exact-match cross-theme consolidation ──
+    concept_theme_counts = (
+        df.groupby(['Merged_Concept', 'Theme'])
+        .size()
+        .reset_index(name='count')
+    )
+
+    idx_max = concept_theme_counts.groupby('Merged_Concept')['count'].idxmax()
+    best_theme = concept_theme_counts.loc[idx_max]
+    concept_to_dominant_theme = dict(zip(best_theme['Merged_Concept'], best_theme['Theme']))
+
+    theme_counts_per_concept = concept_theme_counts.groupby('Merged_Concept')['Theme'].nunique()
+    multi_theme_concepts = theme_counts_per_concept[theme_counts_per_concept > 1].index.tolist()
+
+    exact_merges = 0
+    if multi_theme_concepts:
+        for concept in multi_theme_concepts:
+            dominant = concept_to_dominant_theme[concept]
+            mask = df['Merged_Concept'] == concept
+            changed = (df.loc[mask, 'Theme'] != dominant).sum()
+            if changed > 0:
+                df.loc[mask, 'Theme'] = dominant
+                exact_merges += changed
+
+        if exact_merges:
+            print(f"   🔄 Cross-theme consolidation ({type_label}): {len(multi_theme_concepts)} concept(s) "
+                  f"found in multiple themes — {exact_merges} row(s) reassigned to dominant theme.")
+
+    # ── Phase 2: AI-powered cross-theme clustering (iterative) ──
+    if not llm_provider:
+        return df
+
+    MAX_ROUNDS = 3
+
+    for round_num in range(1, MAX_ROUNDS + 1):
+        all_labels = df.groupby('Merged_Concept').agg(
+            theme=('Theme', 'first'),
+            count=('Merged_Concept', 'size')
+        ).reset_index()
+
+        themes_present = all_labels['theme'].nunique()
+        if themes_present < 2 or len(all_labels) < 4:
+            break
+
+        batch_size = SEMANTIC_DEDUP_BATCH_SIZE
+        label_rows = all_labels.sort_values('count', ascending=False)
+        label_list = label_rows[['Merged_Concept', 'theme', 'count']].values.tolist()
+
+        cross_theme_map = {}
+        round_merges = 0
+
+        for batch_start in range(0, len(label_list), batch_size):
+            batch = label_list[batch_start:batch_start + batch_size]
+            if len(batch) <= 1:
+                continue
+
+            lines = [f"[{theme}] {lbl}  ({cnt} mentions)" for lbl, theme, cnt in batch]
+            labels_text = "\n".join(lines)
+            batch_labels = [lbl for lbl, _, _ in batch]
+
+            prompt = f"""You are deduplicating {type_label.lower()} concept labels from ACROSS different themes.
+These labels come from different thematic categories but some may be the SAME concept under different themes.
+
+GOAL: Find labels that are linguistic duplicates — the EXACT SAME concept that ended up
+under different themes due to different wording.
+
+MERGE ONLY when:
+• Two labels from different themes are clearly the SAME concept with different phrasing
+  e.g. [Theme A] "Poor teaching quality" = [Theme B] "Low quality of education"
+
+KEEP SEPARATE — do NOT merge:
+• Related but distinct concepts, even if they share some words
+  "Child labour" ≠ "Poverty" (different concepts)
+  "Elopement" ≠ "Child marriage" (specific type vs general category)
+• A cause and its effect
+• A sub-type and its parent category
+
+IMPORTANT: When in doubt, keep concepts SEPARATE.
+
+When merging, use the label with MORE mentions as canonical.
+
+INPUT LABELS (format: [Theme] Label (count)):
+{labels_text}
+
+OUTPUT: JSON object mapping EVERY input label (without theme prefix or count) to its canonical label.
+Only true duplicates share a canonical label. Everything else maps to itself.
+RETURN ONLY VALID JSON. NO MARKDOWN."""
+
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    response = llm_provider.generate_text(
+                        prompt,
+                        max_tokens=REFINE_MAX_TOKENS,
+                        temperature=0,
+                        thinking_budget=REFINE_THINKING_BUDGET,
+                    )
+                    parsed = json.loads(_extract_json_block(response))
+                    if not isinstance(parsed, dict):
+                        raise ValueError("Expected dict")
+
+                    known_labels = set(batch_labels)
+                    for lbl in batch_labels:
+                        mapped = parsed.get(lbl, lbl)
+                        if mapped in known_labels:
+                            cross_theme_map[lbl] = mapped
+                        else:
+                            cross_theme_map[lbl] = lbl
+                    break
+
+                except Exception as e:
+                    if attempt < MAX_RETRIES:
+                        time.sleep(BASE_RETRY_SECONDS * (2 ** (attempt - 1)))
+                        continue
+                    print(f"      ⚠️ Cross-theme clustering failed: {e}. Skipping batch.")
+                    for lbl in batch_labels:
+                        cross_theme_map.setdefault(lbl, lbl)
+                    break
+
+        round_merges = sum(1 for k, v in cross_theme_map.items() if k != v)
+        if round_merges:
+            print(f"   🔗 Cross-theme clustering ({type_label}) round {round_num}: {round_merges} concept(s) merged.")
+            df['Merged_Concept'] = df['Merged_Concept'].map(cross_theme_map).fillna(df['Merged_Concept'])
+            # Reassign to dominant theme after merging labels
+            ct = df.groupby(['Merged_Concept', 'Theme']).size().reset_index(name='count')
+            idx = ct.groupby('Merged_Concept')['count'].idxmax()
+            best = ct.loc[idx]
+            dom = dict(zip(best['Merged_Concept'], best['Theme']))
+            df['Theme'] = df['Merged_Concept'].map(dom).fillna(df['Theme'])
+        else:
+            print(f"   ✅ Cross-theme clustering ({type_label}) round {round_num}: converged.")
+            break
+
+    return df
+
 
 def generate_report():
     print("🚀 Starting Final Report Generation Engine...")
@@ -639,26 +1116,90 @@ def generate_report():
     df_s['Agency'] = df_s['Solutions'].apply(categorize_agency)
 
     # --- AI REFINEMENT STEP ---
-    # Get top 200 concepts to refine (Increased from 100 to catch more variations)
-    top_chal = df_c['Merged_Concept'].value_counts().head(200).index.tolist()
-    top_sol = df_s['Merged_Concept'].value_counts().head(200).index.tolist()
+    # Refine ALL unique concepts (dynamically scaled, no hardcoded cap)
+    top_chal = df_c['Merged_Concept'].value_counts().index.tolist()
+    top_sol = df_s['Merged_Concept'].value_counts().index.tolist()
     
     # Refine Challenges
     chal_updates = refine_concepts_with_ai(top_chal, "Challenge")
+    chal_updates = _cross_batch_dedup(chal_updates, "Challenge")
     if chal_updates:
         # Apply updates
         for old, new_data in chal_updates.items():
             mask = df_c['Merged_Concept'] == old
             df_c.loc[mask, 'Merged_Concept'] = new_data['concept']
             df_c.loc[mask, 'Theme'] = new_data['theme']
-            
+
+    # Post-refinement consolidation: merge any canonical labels that are still near-duplicates
+    # (can happen when different AI batches independently chose slightly different canonical strings
+    #  for the same underlying concept). Run PER-THEME to prevent cross-theme label contamination.
+    def _consolidate_canonical_labels(df_slice):
+        """Collapse near-duplicate canonical labels within a dataframe slice."""
+        label_counts = df_slice['Merged_Concept'].value_counts().to_dict()
+        labels = list(label_counts.keys())
+        parent = {lbl: lbl for lbl in labels}
+
+        def _find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def _union(a, b):
+            ra, rb = _find(a), _find(b)
+            if ra == rb:
+                return
+            if label_counts.get(ra, 0) >= label_counts.get(rb, 0):
+                parent[rb] = ra
+            else:
+                parent[ra] = rb
+
+        for i, la in enumerate(labels):
+            ka = normalize_concept_key(la)
+            for lb in labels[i + 1:]:
+                kb = normalize_concept_key(lb)
+                if _are_concepts_similar(ka, kb):
+                    _union(la, lb)
+
+        mapping = {lbl: _find(lbl) for lbl in labels}
+        result = df_slice.copy()
+        result['Merged_Concept'] = result['Merged_Concept'].map(mapping).fillna(result['Merged_Concept'])
+        return result
+
+    def _consolidate_by_theme(df):
+        """Run consolidation per theme to avoid cross-theme label contamination."""
+        frames = [_consolidate_canonical_labels(grp) for _, grp in df.groupby('Theme', sort=False)]
+        return pd.concat(frames, ignore_index=True) if frames else df
+
+    df_c = _consolidate_by_theme(df_c)
+
+    # Per-theme semantic dedup (catches zero-vocabulary-overlap duplicates via AI)
+    print("   🔗 Running per-theme semantic deduplication for Challenges...")
+    df_c = _semantic_dedup_per_theme(df_c, "Challenge")
+
     # Refine Solutions
     sol_updates = refine_concepts_with_ai(top_sol, "Solution")
+    sol_updates = _cross_batch_dedup(sol_updates, "Solution")
     if sol_updates:
         for old, new_data in sol_updates.items():
             mask = df_s['Merged_Concept'] == old
             df_s.loc[mask, 'Merged_Concept'] = new_data['concept']
             df_s.loc[mask, 'Theme'] = new_data['theme']
+
+    df_s = _consolidate_by_theme(df_s)
+
+    # Per-theme semantic dedup for Solutions
+    print("   🔗 Running per-theme semantic deduplication for Solutions...")
+    df_s = _semantic_dedup_per_theme(df_s, "Solution")
+
+    # --- CROSS-THEME CONCEPT CONSOLIDATION ---
+    # Fix concepts that ended up in multiple themes (e.g., "Child labour" under both
+    # "Poverty" and "Parental Attitudes"). Reassigns to dominant theme + merges
+    # semantically identical concepts across themes.
+    print("   🔄 Running cross-theme concept consolidation for Challenges...")
+    df_c = _consolidate_cross_theme_concepts(df_c, "Challenge")
+    print("   🔄 Running cross-theme concept consolidation for Solutions...")
+    df_s = _consolidate_cross_theme_concepts(df_s, "Solution")
 
     # Re-clean themes just in case AI returned something weird
     df_c['Theme'] = df_c['Theme'].apply(clean_theme_name)
