@@ -3,6 +3,7 @@ import re
 import os
 import time
 import random
+from difflib import SequenceMatcher
 from docx import Document
 from docx.shared import Pt
 from docx.oxml.ns import qn
@@ -37,6 +38,12 @@ MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "5"))
 BASE_RETRY_SECONDS = float(os.getenv("LLM_RETRY_BASE_SECONDS", "2"))
 MAX_RETRY_SECONDS = float(os.getenv("LLM_RETRY_MAX_SECONDS", "45"))
 REFINE_CHECKPOINT_DIR = os.getenv("REFINE_CHECKPOINT_DIR", ".")
+REFINE_BATCH_SIZE = int(os.getenv("REFINE_BATCH_SIZE", "25"))
+REFINE_MAX_TOKENS = int(os.getenv("REFINE_MAX_TOKENS", "6000"))
+REFINE_THINKING_BUDGET = int(os.getenv("REFINE_THINKING_BUDGET", "256"))
+INSIGHT_MAX_TOKENS = int(os.getenv("INSIGHT_MAX_TOKENS", "900"))
+INSIGHT_THINKING_BUDGET = int(os.getenv("INSIGHT_THINKING_BUDGET", "256"))
+INSIGHT_TEMPERATURE = float(os.getenv("INSIGHT_TEMPERATURE", "0.15"))
 
 
 def is_retryable_error(error):
@@ -49,6 +56,9 @@ def is_retryable_error(error):
         "throttle",
         "temporarily unavailable",
         "timeout",
+        "max_tokens",
+        "missing text parts",
+        "thinking budget",
     ]
     return any(signal in message for signal in retry_signals)
 
@@ -74,6 +84,58 @@ def save_refinement_checkpoint(checkpoint_path, results):
     os.makedirs(os.path.dirname(checkpoint_path) or ".", exist_ok=True)
     with open(checkpoint_path, "w", encoding="utf-8") as file:
         json.dump(results, file, ensure_ascii=False, indent=2)
+
+
+def _extract_json_block(text):
+    cleaned = str(text).replace('```json', '').replace('```', '').strip()
+    start = cleaned.find('{')
+    end = cleaned.rfind('}')
+    if start != -1 and end != -1 and end > start:
+        return cleaned[start:end + 1]
+    return cleaned
+
+
+def _parse_refinement_response(text, batch):
+    raw_json = _extract_json_block(text)
+    parsed = json.loads(raw_json)
+    if not isinstance(parsed, dict):
+        raise ValueError("Refinement response is not a JSON object")
+
+    valid = {}
+    for item in batch:
+        value = parsed.get(item)
+        if not isinstance(value, dict):
+            continue
+        concept = str(value.get('concept', '')).strip()
+        theme = str(value.get('theme', '')).strip()
+        if concept and theme:
+            valid[item] = {'concept': concept, 'theme': theme}
+
+    if not valid:
+        raise ValueError("No valid refinement mappings found in response")
+
+    return valid
+
+
+def _repair_refinement_json_with_ai(raw_text, batch, type_label):
+    if not llm_provider:
+        return None
+
+    repair_prompt = f"""Fix the malformed JSON below.
+
+RULES:
+1. Return ONLY valid JSON object.
+2. Keys must come from this input list: {json.dumps(batch, ensure_ascii=False)}
+3. Each value must be an object with keys: concept, theme.
+4. Keep meaning intact. Do not add extra text.
+
+MALFORMED JSON/TEXT:
+{raw_text}
+
+OUTPUT: valid JSON object only."""
+
+    repaired = llm_provider.generate_text(repair_prompt, max_tokens=2500, temperature=0)
+    return _parse_refinement_response(repaired, batch)
 
 def categorize_environment_aggressive(text):
     """Ultra-Aggressive Environment Classification to minimize Unmapped tags."""
@@ -147,12 +209,154 @@ def clean_theme_name(text):
     
     return text
 
-def _challenge_item_insight(theme, concept, share, count, t_c, t_s, challenge_texts, max_words=100):
+
+def normalize_concept_key(text):
+    """Canonical key for grouping near-duplicate concept labels."""
+    if pd.isna(text):
+        return ""
+
+    normalized = str(text).strip().lower()
+    normalized = re.sub(r'\s+', ' ', normalized)
+    normalized = re.sub(r'[^a-z0-9\s]', '', normalized)
+    return normalized.strip()
+
+
+def _tokenize_concept_key(text):
+    if not text:
+        return set()
+
+    stopwords = {
+        'a', 'an', 'the', 'and', 'or', 'of', 'to', 'for', 'in', 'on', 'at', 'by',
+        'with', 'from', 'is', 'are', 'was', 'were', 'be', 'being', 'this', 'that'
+    }
+
+    tokens = []
+    for token in str(text).split():
+        token = token.strip()
+        if not token or token in stopwords:
+            continue
+        if token.endswith('ation') and len(token) > 7:
+            token = token[:-5]
+        elif token.endswith('tion') and len(token) > 6:
+            token = token[:-4]
+        if token.endswith('ing') and len(token) > 5:
+            token = token[:-3]
+        elif token.endswith('ed') and len(token) > 4:
+            token = token[:-2]
+        elif token.endswith('es') and len(token) > 4:
+            token = token[:-2]
+        elif token.endswith('s') and len(token) > 3:
+            token = token[:-1]
+        if token and token not in stopwords:
+            tokens.append(token)
+
+    return set(tokens)
+
+
+def _soft_token_overlap(tokens_a, tokens_b):
+    """Counts token overlap allowing near-lexical matches (generic, no domain keywords)."""
+    if not tokens_a or not tokens_b:
+        return 0
+
+    used_b = set()
+    overlap = 0
+
+    for token_a in tokens_a:
+        best_index = None
+        best_score = 0.0
+        for index, token_b in enumerate(tokens_b):
+            if index in used_b:
+                continue
+            score = SequenceMatcher(None, token_a, token_b).ratio()
+            if score > best_score:
+                best_score = score
+                best_index = index
+        if best_index is not None and best_score >= 0.8:
+            used_b.add(best_index)
+            overlap += 1
+
+    return overlap
+
+
+def _are_concepts_similar(key_a, key_b):
+    if not key_a or not key_b:
+        return False
+    if key_a == key_b:
+        return True
+
+    tokens_a = _tokenize_concept_key(key_a)
+    tokens_b = _tokenize_concept_key(key_b)
+    if not tokens_a or not tokens_b:
+        return False
+
+    tokens_a_list = sorted(tokens_a)
+    tokens_b_list = sorted(tokens_b)
+    soft_intersection = _soft_token_overlap(tokens_a_list, tokens_b_list)
+
+    union = len(tokens_a) + len(tokens_b) - soft_intersection
+    jaccard = (soft_intersection / union) if union else 0.0
+    overlap = soft_intersection / min(len(tokens_a), len(tokens_b))
+    seq_ratio = SequenceMatcher(None, key_a, key_b).ratio()
+
+    return (overlap >= 0.6 and jaccard >= 0.34) or seq_ratio >= 0.84
+
+
+def assign_concept_groups(df, concept_column='Merged_Concept'):
+    """Generic concept clustering without hardcoded domain keywords or extra API calls."""
+    if df.empty:
+        temp = df.copy()
+        temp['Concept_Key'] = ""
+        temp['Concept_Group'] = ""
+        return temp
+
+    temp = df.copy()
+    temp['Concept_Key'] = temp[concept_column].apply(normalize_concept_key)
+    temp = temp[temp['Concept_Key'] != ""].copy()
+    if temp.empty:
+        temp['Concept_Group'] = ""
+        return temp
+
+    key_counts = temp['Concept_Key'].value_counts().to_dict()
+    keys = list(key_counts.keys())
+
+    parent = {key: key for key in keys}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        root_a, root_b = find(a), find(b)
+        if root_a == root_b:
+            return
+        # keep larger-frequency root as canonical parent
+        if key_counts.get(root_a, 0) >= key_counts.get(root_b, 0):
+            parent[root_b] = root_a
+        else:
+            parent[root_a] = root_b
+
+    for i, key_a in enumerate(keys):
+        for key_b in keys[i + 1:]:
+            if _are_concepts_similar(key_a, key_b):
+                union(key_a, key_b)
+
+    group_map = {key: find(key) for key in keys}
+    temp['Concept_Group'] = temp['Concept_Key'].map(group_map)
+    return temp
+
+def _challenge_item_insight(theme, concept, share, count, t_c, t_s, challenge_texts, max_words=100, concept_key=None, concept_rows=None):
     """Creates 2-3 deep, specific insight sentences (max 100 words) revealing ground realities."""
     total_theme_chal = len(t_c)
     total_theme_sol = len(t_s)
 
-    concept_rows = t_c[t_c['Merged_Concept'] == concept]
+    if concept_rows is not None:
+        concept_rows = concept_rows.copy()
+    elif concept_key is not None:
+        concept_rows = t_c[t_c['Merged_Concept'].apply(normalize_concept_key) == concept_key]
+    else:
+        concept_rows = t_c[t_c['Merged_Concept'] == concept]
     districts = concept_rows['District'].nunique() if not concept_rows.empty and 'District' in concept_rows.columns else 0
 
     env_text = "Not available"
@@ -214,7 +418,12 @@ WORD LIMIT: Maximum 100 words total.
 OUTPUT: Return 2-3 distinct, non-overlapping, grammatically perfect insight sentences. Separate with double newlines."""
 
     try:
-        response = llm_provider.generate_text(prompt, max_tokens=250, temperature=0.15)
+        response = llm_provider.generate_text(
+            prompt,
+            max_tokens=INSIGHT_MAX_TOKENS,
+            temperature=INSIGHT_TEMPERATURE,
+            thinking_budget=INSIGHT_THINKING_BUDGET,
+        )
         cleaned = str(response).replace("```", "").strip()
         
         # Clean up text: fix spacing, grammar, and formatting
@@ -315,7 +524,7 @@ def refine_concepts_with_ai(concepts_list, type_label):
         print(f"      ✅ No pending refinement for {type_label}. Using cached results.")
         return all_results
 
-    batch_size = 50
+    batch_size = REFINE_BATCH_SIZE
 
     total_batches = (len(pending_concepts) + batch_size - 1) // batch_size
     for i in range(0, len(pending_concepts), batch_size):
@@ -357,15 +566,18 @@ def refine_concepts_with_ai(concepts_list, type_label):
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                text = llm_provider.generate_text(prompt, max_tokens=4000, temperature=0)
+                text = llm_provider.generate_text(
+                    prompt,
+                    max_tokens=REFINE_MAX_TOKENS,
+                    temperature=0,
+                    thinking_budget=REFINE_THINKING_BUDGET,
+                )
 
-                json_match = re.search(r'\{.*\}', text, re.DOTALL)
-                if json_match:
-                    text = json_match.group(0)
-                else:
-                    text = text.replace('```json', '').replace('```', '').strip()
+                try:
+                    batch_result = _parse_refinement_response(text, batch)
+                except Exception:
+                    batch_result = _repair_refinement_json_with_ai(text, batch, type_label)
 
-                batch_result = json.loads(text)
                 all_results.update(batch_result)
                 save_refinement_checkpoint(checkpoint_path, all_results)
                 print(f"      ✅ Batch {current_batch} saved ({len(batch_result)} items).")
@@ -373,7 +585,8 @@ def refine_concepts_with_ai(concepts_list, type_label):
 
             except Exception as error:
                 retryable = is_retryable_error(error)
-                should_retry = retryable and attempt < MAX_RETRIES
+                parse_error = isinstance(error, (json.JSONDecodeError, ValueError, TypeError))
+                should_retry = (retryable or parse_error) and attempt < MAX_RETRIES
                 print(f"      ⚠️ Batch {current_batch} attempt {attempt}/{MAX_RETRIES} failed: {error}")
 
                 if should_retry:
@@ -797,19 +1010,37 @@ def generate_report():
         
         doc.add_heading("Top Recurring Challenges", level=5)
         
-        # Logic for 50% coverage
-        chal_counts = t_c['Merged_Concept'].value_counts()
+        # Logic for 50% coverage (after canonical grouping to avoid duplicate labels)
+        grouped_challenges = []
+        challenges_with_key = assign_concept_groups(t_c, concept_column='Merged_Concept')
+
+        for concept_key, group in challenges_with_key.groupby('Concept_Group'):
+            mention_count = len(group)
+            display_concept = group['Merged_Concept'].value_counts().idxmax()
+            grouped_challenges.append((display_concept, mention_count, concept_key))
+
+        grouped_challenges = sorted(grouped_challenges, key=lambda item: item[1], reverse=True)
         total_theme_chal = len(t_c)
         cumulative_count = 0
-        
-        for i, (concept, count) in enumerate(chal_counts.items(), 1):
+
+        for i, (concept, count, concept_key) in enumerate(grouped_challenges, 1):
             cumulative_count += count
             coverage_perc = (cumulative_count / total_theme_chal) * 100
             item_perc = (count / total_theme_chal) * 100
             
             # Find representative quote (longest original text for this concept)
-            original_texts = t_c[t_c['Merged_Concept'] == concept]['Challenges'].tolist()
-            rep_quote = max(original_texts, key=len) if original_texts else concept
+            concept_group_rows = challenges_with_key[challenges_with_key['Concept_Group'] == concept_key]
+            original_texts = concept_group_rows['Challenges'].tolist()
+
+            rep_quote = concept
+            rep_district = "Unknown"
+            if not concept_group_rows.empty:
+                text_lengths = concept_group_rows['Challenges'].astype(str).str.len()
+                rep_idx = text_lengths.idxmax()
+                rep_row = concept_group_rows.loc[rep_idx]
+                rep_quote = str(rep_row.get('Challenges', concept)).strip() or concept
+                if 'District' in concept_group_rows.columns and pd.notna(rep_row.get('District')):
+                    rep_district = str(rep_row.get('District')).strip() or "Unknown"
             
             p = doc.add_paragraph()
             p.paragraph_format.left_indent = Pt(36)
@@ -818,7 +1049,18 @@ def generate_report():
             p.add_run(f" ({count} mentions, {item_perc:.1f}%)")
 
             # Get insight paragraphs (2-3 paragraphs, max 150 words total) - analyze actual voices
-            insight_paragraphs = _challenge_item_insight(theme, concept, item_perc, count, t_c, t_s, original_texts, max_words=150)
+            insight_paragraphs = _challenge_item_insight(
+                theme,
+                concept,
+                item_perc,
+                count,
+                t_c,
+                t_s,
+                original_texts,
+                max_words=150,
+                concept_key=concept_key,
+                concept_rows=concept_group_rows,
+            )
             
             # If quote is short (< 100 chars), use only first insight paragraph
             quote_length = len(rep_quote) if rep_quote else 0
@@ -832,7 +1074,7 @@ def generate_report():
 
             quote_para = doc.add_paragraph()
             quote_para.paragraph_format.left_indent = Pt(54)
-            quote_para.add_run(f"Voice from the ground: \"{rep_quote}\"").italic = True
+            quote_para.add_run(f"Voice from the ground ({rep_district}): \"{rep_quote}\"").italic = True
             
             if coverage_perc >= 50 and i >= 5: # At least 5 items, or until 50%
                 break
@@ -852,14 +1094,22 @@ def generate_report():
             doc.add_heading("Most Frequently Proposed Solutions", level=5)
 
             # Keep only top 5 solutions by highest mentions
-            sol_counts = t_s['Merged_Concept'].value_counts()
-            top_solutions = [(concept, count) for concept, count in sol_counts.items() if is_valid_solution(concept)][:5]
+            valid_solutions = t_s[t_s['Merged_Concept'].apply(is_valid_solution)].copy()
+            valid_solutions = assign_concept_groups(valid_solutions, concept_column='Merged_Concept')
 
-            for rank, (concept, count) in enumerate(top_solutions, 1):
+            grouped_solutions = []
+            for concept_key, group in valid_solutions.groupby('Concept_Group'):
+                mention_count = len(group)
+                display_concept = group['Merged_Concept'].value_counts().idxmax()
+                grouped_solutions.append((display_concept, mention_count, concept_key))
+
+            top_solutions = sorted(grouped_solutions, key=lambda item: item[1], reverse=True)[:5]
+
+            for rank, (concept, count, concept_key) in enumerate(top_solutions, 1):
                 item_perc = (count / total_theme_sol) * 100
 
                 # Find representative quote
-                original_texts = t_s[t_s['Merged_Concept'] == concept]['Solutions'].tolist()
+                original_texts = valid_solutions[valid_solutions['Concept_Group'] == concept_key]['Solutions'].tolist()
                 rep_quote = max(original_texts, key=len) if original_texts else concept
 
                 p = doc.add_paragraph()

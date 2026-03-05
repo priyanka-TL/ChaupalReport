@@ -1,5 +1,7 @@
 import json
 import os
+import time
+from datetime import datetime
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -36,6 +38,23 @@ class LLMProvider:
         else:
             raise ValueError("Unsupported LLM_PROVIDER. Use 'claude' or 'gemini'.")
 
+        self.call_counter = 0
+        self.log_file = os.getenv("LLM_CALL_LOG_FILE", "ai_calls.log")
+
+    def _next_call_id(self):
+        self.call_counter += 1
+        return self.call_counter
+
+    def _current_model(self):
+        return self.claude_model_id if self.provider == "claude" else self.gemini_model
+
+    def _append_log(self, payload):
+        try:
+            with open(self.log_file, "a", encoding="utf-8") as file:
+                file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
     def _normalize_gemini_model(self, model_name):
         model_name = (model_name or "gemini-2.0-flash").strip()
         if model_name.startswith("models/"):
@@ -49,7 +68,31 @@ class LLMProvider:
             return f"claude ({self.claude_model_id})"
         return f"gemini ({self.gemini_model})"
 
-    def generate_text(self, prompt, max_tokens=4000, temperature=0):
+    def generate_text(self, prompt, max_tokens=4000, temperature=0, thinking_budget=None):
+        call_id = self._next_call_id()
+        started_at = time.time()
+        prompt_text = str(prompt)
+        prompt_preview = prompt_text[:180].replace("\n", " ")
+
+        print(
+            f"🤖 AI Call #{call_id} started | provider={self.provider} | model={self._current_model()} | prompt_chars={len(prompt_text)}",
+            flush=True,
+        )
+        self._append_log(
+            {
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "event": "start",
+                "call_id": call_id,
+                "provider": self.provider,
+                "model": self._current_model(),
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "thinking_budget": thinking_budget,
+                "prompt_chars": len(prompt_text),
+                "prompt_preview": prompt_preview,
+            }
+        )
+
         if self.provider == "claude":
             request_body = {
                 "anthropic_version": self.claude_model_version,
@@ -68,7 +111,21 @@ class LLMProvider:
                 body=json.dumps(request_body),
             )
             response_body = json.loads(response.get("body").read())
-            return response_body["content"][0]["text"].strip()
+            output_text = response_body["content"][0]["text"].strip()
+            duration = time.time() - started_at
+            print(f"✅ AI Call #{call_id} completed in {duration:.2f}s", flush=True)
+            self._append_log(
+                {
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "event": "success",
+                    "call_id": call_id,
+                    "provider": self.provider,
+                    "model": self._current_model(),
+                    "duration_seconds": round(duration, 3),
+                    "response_chars": len(output_text),
+                }
+            )
+            return output_text
 
         endpoint = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -82,6 +139,10 @@ class LLMProvider:
                 "maxOutputTokens": max_tokens,
             },
         }
+        if thinking_budget is not None:
+            payload["generationConfig"]["thinkingConfig"] = {
+                "thinkingBudget": int(thinking_budget)
+            }
 
         request = urllib.request.Request(
             endpoint,
@@ -95,7 +156,67 @@ class LLMProvider:
                 response_body = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             body = error.read().decode("utf-8", errors="ignore")
-            if error.code == 404 and self.gemini_model != "gemini-2.0-flash":
+            # Some Gemini models (e.g., gemini-2.5-pro) reject thinkingBudget=0 and require thinking mode.
+            # Gracefully retry once without thinkingConfig for this specific error.
+            if (
+                error.code == 400
+                and thinking_budget is not None
+                and "budget 0 is invalid" in body.lower()
+            ):
+                payload_no_thinking = {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "temperature": temperature,
+                        "maxOutputTokens": max_tokens,
+                    },
+                }
+                retry_request = urllib.request.Request(
+                    endpoint,
+                    data=json.dumps(payload_no_thinking).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                print(
+                    f"⚠️ AI Call #{call_id}: model rejected thinkingBudget={thinking_budget}; retrying without thinkingConfig",
+                    flush=True,
+                )
+                try:
+                    with urllib.request.urlopen(retry_request, timeout=120) as response:
+                        response_body = json.loads(response.read().decode("utf-8"))
+                except urllib.error.HTTPError as retry_error:
+                    retry_body = retry_error.read().decode("utf-8", errors="ignore")
+                    duration = time.time() - started_at
+                    error_message = f"Gemini API error {retry_error.code}: {retry_body}"
+                    print(f"❌ AI Call #{call_id} failed in {duration:.2f}s: {error_message}", flush=True)
+                    self._append_log(
+                        {
+                            "timestamp": datetime.utcnow().isoformat() + "Z",
+                            "event": "error",
+                            "call_id": call_id,
+                            "provider": self.provider,
+                            "model": self._current_model(),
+                            "duration_seconds": round(duration, 3),
+                            "error": error_message,
+                        }
+                    )
+                    raise RuntimeError(error_message) from retry_error
+                except Exception as retry_error:
+                    duration = time.time() - started_at
+                    error_message = str(retry_error)
+                    print(f"❌ AI Call #{call_id} failed in {duration:.2f}s: {error_message}", flush=True)
+                    self._append_log(
+                        {
+                            "timestamp": datetime.utcnow().isoformat() + "Z",
+                            "event": "error",
+                            "call_id": call_id,
+                            "provider": self.provider,
+                            "model": self._current_model(),
+                            "duration_seconds": round(duration, 3),
+                            "error": error_message,
+                        }
+                    )
+                    raise
+            elif error.code == 404 and self.gemini_model != "gemini-2.0-flash":
                 fallback_model = "gemini-2.0-flash"
                 fallback_endpoint = (
                     "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -113,9 +234,53 @@ class LLMProvider:
                         response_body = json.loads(response.read().decode("utf-8"))
                     self.gemini_model = fallback_model
                 except urllib.error.HTTPError:
-                    raise RuntimeError(f"Gemini API error {error.code}: {body}") from error
+                    duration = time.time() - started_at
+                    error_message = f"Gemini API error {error.code}: {body}"
+                    print(f"❌ AI Call #{call_id} failed in {duration:.2f}s: {error_message}", flush=True)
+                    self._append_log(
+                        {
+                            "timestamp": datetime.utcnow().isoformat() + "Z",
+                            "event": "error",
+                            "call_id": call_id,
+                            "provider": self.provider,
+                            "model": self._current_model(),
+                            "duration_seconds": round(duration, 3),
+                            "error": error_message,
+                        }
+                    )
+                    raise RuntimeError(error_message) from error
             else:
-                raise RuntimeError(f"Gemini API error {error.code}: {body}") from error
+                duration = time.time() - started_at
+                error_message = f"Gemini API error {error.code}: {body}"
+                print(f"❌ AI Call #{call_id} failed in {duration:.2f}s: {error_message}", flush=True)
+                self._append_log(
+                    {
+                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "event": "error",
+                        "call_id": call_id,
+                        "provider": self.provider,
+                        "model": self._current_model(),
+                        "duration_seconds": round(duration, 3),
+                        "error": error_message,
+                    }
+                )
+                raise RuntimeError(error_message) from error
+        except Exception as error:
+            duration = time.time() - started_at
+            error_message = str(error)
+            print(f"❌ AI Call #{call_id} failed in {duration:.2f}s: {error_message}", flush=True)
+            self._append_log(
+                {
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "event": "error",
+                    "call_id": call_id,
+                    "provider": self.provider,
+                    "model": self._current_model(),
+                    "duration_seconds": round(duration, 3),
+                    "error": error_message,
+                }
+            )
+            raise
 
         candidates = response_body.get("candidates", [])
         if not candidates:
@@ -124,6 +289,35 @@ class LLMProvider:
         parts = candidates[0].get("content", {}).get("parts", [])
         text = "\n".join(part.get("text", "") for part in parts if part.get("text"))
         if not text:
-            raise RuntimeError(f"Gemini response missing text parts: {response_body}")
+            duration = time.time() - started_at
+            error_message = f"Gemini response missing text parts (possible max_tokens or thinking budget issue): {response_body}"
+            print(f"❌ AI Call #{call_id} failed in {duration:.2f}s: {error_message}", flush=True)
+            self._append_log(
+                {
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "event": "error",
+                    "call_id": call_id,
+                    "provider": self.provider,
+                    "model": self._current_model(),
+                    "duration_seconds": round(duration, 3),
+                    "error": error_message,
+                }
+            )
+            raise RuntimeError(error_message)
 
-        return text.strip()
+        output_text = text.strip()
+        duration = time.time() - started_at
+        print(f"✅ AI Call #{call_id} completed in {duration:.2f}s", flush=True)
+        self._append_log(
+            {
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "event": "success",
+                "call_id": call_id,
+                "provider": self.provider,
+                "model": self._current_model(),
+                "duration_seconds": round(duration, 3),
+                "response_chars": len(output_text),
+            }
+        )
+
+        return output_text
