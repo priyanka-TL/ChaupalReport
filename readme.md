@@ -102,11 +102,11 @@ You can place secrets in a `.env` file (loaded via `python-dotenv`).
 Run scripts in this exact order:
 
 ```bash
-python 0_data_cleaner.py
-python 1_data_prep.py
-python 2_ai_tagger.py
-python 3_final_processor.py
-python 4_validation_report.py
+python3 0_data_cleaner.py
+python3 1_data_prep.py
+python3 2_ai_tagger.py
+python3 3_final_processor.py
+python3 4_validation_report.py
 ```
 
 ---

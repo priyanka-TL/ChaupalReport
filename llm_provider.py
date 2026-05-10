@@ -74,6 +74,10 @@ class LLMProvider:
         prompt_text = str(prompt)
         prompt_preview = prompt_text[:180].replace("\n", " ")
 
+        # Gemini Flash models do not support thinking budget.
+        if self.provider == "gemini" and "flash" in self.gemini_model.lower():
+            thinking_budget = None
+
         print(
             f"🤖 AI Call #{call_id} started | provider={self.provider} | model={self._current_model()} | prompt_chars={len(prompt_text)}",
             flush=True,
@@ -161,7 +165,7 @@ class LLMProvider:
             if (
                 error.code == 400
                 and thinking_budget is not None
-                and "budget 0 is invalid" in body.lower()
+                and ("budget 0 is invalid" in body.lower() or "thinking is not supported" in body.lower())
             ):
                 payload_no_thinking = {
                     "contents": [{"parts": [{"text": prompt}]}],
