@@ -39,7 +39,7 @@ BASE_RETRY_SECONDS = float(os.getenv("LLM_RETRY_BASE_SECONDS", "2"))
 MAX_RETRY_SECONDS = float(os.getenv("LLM_RETRY_MAX_SECONDS", "45"))
 REFINE_CHECKPOINT_DIR = os.getenv("REFINE_CHECKPOINT_DIR", ".")
 REFINE_BATCH_SIZE = int(os.getenv("REFINE_BATCH_SIZE", "25"))
-REFINE_MAX_TOKENS = int(os.getenv("REFINE_MAX_TOKENS", "6000"))
+REFINE_MAX_TOKENS = int(os.getenv("REFINE_MAX_TOKENS", "16000"))
 REFINE_THINKING_BUDGET = int(os.getenv("REFINE_THINKING_BUDGET", "256"))
 INSIGHT_MAX_TOKENS = int(os.getenv("INSIGHT_MAX_TOKENS", "900"))
 INSIGHT_THINKING_BUDGET = int(os.getenv("INSIGHT_THINKING_BUDGET", "256"))
@@ -95,11 +95,47 @@ def _extract_json_block(text):
     return cleaned
 
 
+def _sanitize_json(raw):
+    """Fix the two most common LLM JSON issues before parsing.
+
+    1. Invalid \\uXXXX escapes  — Gemini outputs \\unit, \\upar etc. which
+       are not valid JSON Unicode escapes.  Replace \\u not followed by
+       exactly 4 hex digits with \\\\u so the JSON parser sees a literal
+       backslash + u instead of trying (and failing) to decode Unicode.
+
+    2. Trailing commas — some models emit {"a":1,} which is invalid JSON
+       but legal in JavaScript / Python.
+    """
+    # Fix invalid \u escapes
+    fixed = re.sub(r'\\u(?![0-9a-fA-F]{4})', r'\\\\u', raw)
+    # Remove trailing commas before } or ]
+    fixed = re.sub(r',(\s*[}\]])', r'\1', fixed)
+    return fixed
+
+
 def _parse_refinement_response(text, batch):
     raw_json = _extract_json_block(text)
-    parsed = json.loads(raw_json)
+
+    # Try three parsing strategies, most strict first:
+    #  1. Direct json.loads            — correct JSON
+    #  2. json.loads after sanitize    — fixes \uXXXX + trailing commas
+    #  3. ast.literal_eval             — handles single-quoted Python dicts
+    import ast
+    parsed = None
+    last_err = None
+    for strategy in (
+        lambda s: json.loads(s),
+        lambda s: json.loads(_sanitize_json(s)),
+        lambda s: ast.literal_eval(s),
+    ):
+        try:
+            parsed = strategy(raw_json)
+            break
+        except Exception as exc:
+            last_err = exc
+
     if not isinstance(parsed, dict):
-        raise ValueError("Refinement response is not a JSON object")
+        raise ValueError(f"Refinement response is not a JSON object: {last_err}")
 
     valid = {}
     for item in batch:
@@ -136,6 +172,141 @@ OUTPUT: valid JSON object only."""
 
     repaired = llm_provider.generate_text(repair_prompt, max_tokens=2500, temperature=0)
     return _parse_refinement_response(repaired, batch)
+
+def _extract_partial_results(raw_text, batch):
+    """Extract complete key-value pairs from a truncated or malformed JSON response.
+
+    When the model stops before closing the outer ``}``, json.loads and
+    ast.literal_eval both fail.  This regex-based extractor finds every
+    completed ``"key": {"concept": "...", "theme": "..."}`` block, so we can
+    salvage whatever the model did finish generating.
+    """
+    results = {}
+    batch_set = set(batch)
+    key_val_pat = re.compile(r'"((?:[^"\\]|\\.)*?)"\s*:\s*\{([^{}]*?)\}', re.DOTALL)
+    concept_pat = re.compile(r'"concept"\s*:\s*"((?:[^"\\]|\\.)*?)"', re.DOTALL)
+    theme_pat = re.compile(r'"theme"\s*:\s*"((?:[^"\\]|\\.)*?)"', re.DOTALL)
+    for m in key_val_pat.finditer(raw_text):
+        key = m.group(1)
+        inner = m.group(2)
+        if key not in batch_set:
+            continue
+        cm = concept_pat.search(inner)
+        tm = theme_pat.search(inner)
+        if cm and tm:
+            concept = cm.group(1).strip()
+            theme = tm.group(1).strip()
+            if concept and theme:
+                results[key] = {'concept': concept, 'theme': theme}
+    return results
+
+
+def _run_refinement_batch(batch, type_label, batch_label, max_retries=None):
+    """Process one refinement batch: retries → partial extraction → sub-batch fallback.
+
+    Never calls a secondary repair API — instead extracts partial results from
+    whatever the model returned, and falls back to 5-item sub-batches when a
+    full batch fails all retries.
+    """
+    if max_retries is None:
+        max_retries = MAX_RETRIES
+
+    prompt = f"""You are a Data Cleaning Expert for an Education Report.
+
+THEMES:
+{THEME_KNOWLEDGE_BASE}
+
+INPUT: A list of top recurring {type_label}s found in the data.
+
+TASKS:
+1. AGGRESSIVE DEDUPLICATION: Merge specific variants into broader core concepts.
+   - "Child labor in agriculture" / "Child labor at home" / "Child labour due to poverty" -> MERGE ALL INTO "Child Labour"
+   - "Poverty preventing girls' education" / "Poverty preventing school attendance" -> MERGE ALL INTO "Poverty preventing education"
+   - "Lack of awareness" / "General awareness" -> MERGE INTO "Lack of awareness about education importance"
+2. RE-THEME: Correct misclassified items.
+3. FORMAT: Ensure the concept is a clear, concise {type_label} statement.
+
+INPUT LIST:
+{json.dumps(batch)}
+
+OUTPUT:
+Return a VALID JSON object where keys are the INPUT strings and values are objects with "concept" and "theme".
+IMPORTANT:
+- Escape all double quotes within strings.
+- Do not include any text outside the JSON block.
+- The JSON must be COMPLETE — every opening brace must have a matching closing brace.
+
+Example:
+{{
+    "Child labor in agriculture": {{"concept": "Child Labour", "theme": "Poverty and Economic Barriers"}},
+    "General awareness": {{"concept": "Lack of awareness about education importance", "theme": "Other Factors"}}
+}}
+RETURN ONLY JSON. NO MARKDOWN."""
+
+    last_text = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            text = llm_provider.generate_text(
+                prompt,
+                max_tokens=REFINE_MAX_TOKENS,
+                temperature=0,
+                thinking_budget=REFINE_THINKING_BUDGET,
+            )
+            last_text = text
+
+            try:
+                return _parse_refinement_response(text, batch)
+            except Exception:
+                pass
+
+            # Standard parse failed — try partial extraction (handles truncated JSON)
+            partial = _extract_partial_results(text, batch)
+            if partial:
+                print(f"         ℹ️ Attempt {attempt}: partial extraction recovered {len(partial)}/{len(batch)} items.")
+                return partial
+
+            print(f"      ⚠️ Batch {batch_label} attempt {attempt}/{max_retries}: response yielded 0 valid items.")
+
+        except Exception as error:
+            print(f"      ⚠️ Batch {batch_label} attempt {attempt}/{max_retries} API error: {error}")
+            if is_retryable_error(error) and attempt < max_retries:
+                delay = min(MAX_RETRY_SECONDS, BASE_RETRY_SECONDS * (2 ** (attempt - 1)))
+                delay += random.uniform(0, 0.5)
+                print(f"      🔁 Retrying in {delay:.1f}s...")
+                time.sleep(delay)
+                continue
+            break
+
+        if attempt < max_retries:
+            delay = min(MAX_RETRY_SECONDS, BASE_RETRY_SECONDS * (2 ** (attempt - 1)))
+            delay += random.uniform(0, 0.5)
+            print(f"      🔁 Retrying in {delay:.1f}s...")
+            time.sleep(delay)
+
+    # All retries exhausted — fall back to 5-item sub-batches when batch is large
+    if len(batch) > 5:
+        print(f"      🔀 Batch {batch_label}: retries exhausted; splitting into sub-batches of 5...")
+        results = {}
+        sub_size = 5
+        sub_count = (len(batch) + sub_size - 1) // sub_size
+        for j in range(0, len(batch), sub_size):
+            sub = batch[j:j + sub_size]
+            sub_label = f"{batch_label}.{j // sub_size + 1}/{sub_count}"
+            print(f"         Sub-batch {sub_label} ({len(sub)} items)...")
+            sub_result = _run_refinement_batch(sub, type_label, sub_label, max_retries=2)
+            results.update(sub_result)
+        return results
+
+    # Last resort: partial from the last response we received
+    if last_text:
+        partial = _extract_partial_results(last_text, batch)
+        if partial:
+            print(f"      ℹ️ Last-resort partial extraction: {len(partial)}/{len(batch)} items.")
+            return partial
+
+    print(f"      ❌ Batch {batch_label} failed completely — items keep original mapping.")
+    return {}
+
 
 def categorize_environment_aggressive(text):
     """Ultra-Aggressive Environment Classification to minimize Unmapped tags."""
@@ -525,80 +696,22 @@ def refine_concepts_with_ai(concepts_list, type_label):
         return all_results
 
     batch_size = REFINE_BATCH_SIZE
-
     total_batches = (len(pending_concepts) + batch_size - 1) // batch_size
+
     for i in range(0, len(pending_concepts), batch_size):
-        batch = pending_concepts[i:i+batch_size]
+        batch = pending_concepts[i:i + batch_size]
         current_batch = (i // batch_size) + 1
         print(f"      Processing batch {current_batch}/{total_batches} ({len(batch)} items)...")
-        
-        prompt = f"""You are a Data Cleaning Expert for an Education Report.
-        
-        THEMES:
-        {THEME_KNOWLEDGE_BASE}
-        
-        INPUT: A list of top recurring {type_label}s found in the data.
-        
-        TASKS:
-        1. AGGRESSIVE DEDUPLICATION: Merge specific variants into broader core concepts.
-           - "Child labor in agriculture" / "Child labor at home" / "Child labour due to poverty" / "Child labour preventing education" -> MERGE ALL INTO "Child Labour"
-           - "Poverty preventing girls' education" / "Poverty preventing school attendance" / "Poverty preventing children's education" -> MERGE ALL INTO "Poverty preventing education"
-           - "Lack of awareness" / "General awareness" -> MERGE INTO "Lack of awareness about education importance"
-        2. RE-THEME: Correct misclassified items.
-        3. FORMAT: Ensure the concept is a clear, concise {type_label} statement.
-        
-        INPUT LIST:
-        {json.dumps(batch)}
-        
-        OUTPUT:
-        Return a VALID JSON object where keys are the INPUT strings and values are objects with "concept" and "theme".
-        IMPORTANT: 
-        - Escape all double quotes within strings (e.g., \"text\").
-        - Do not include any text outside the JSON block.
-        - Ensure the JSON is valid.
-        
-        Example:
-        {{
-            "Child labor in agriculture": {{"concept": "Child Labour", "theme": "Poverty and Economic Barriers"}},
-            "General awareness": {{"concept": "Lack of awareness about education importance", "theme": "Other Factors"}}
-        }}
-        RETURN ONLY JSON. NO MARKDOWN."""
 
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                text = llm_provider.generate_text(
-                    prompt,
-                    max_tokens=REFINE_MAX_TOKENS,
-                    temperature=0,
-                    thinking_budget=REFINE_THINKING_BUDGET,
-                )
+        batch_result = _run_refinement_batch(batch, type_label, current_batch)
 
-                try:
-                    batch_result = _parse_refinement_response(text, batch)
-                except Exception:
-                    batch_result = _repair_refinement_json_with_ai(text, batch, type_label)
+        if batch_result:
+            all_results.update(batch_result)
+            save_refinement_checkpoint(checkpoint_path, all_results)
+            print(f"      ✅ Batch {current_batch} saved ({len(batch_result)} items).")
+        else:
+            print(f"      ⚠️ Batch {current_batch}: no results — items keep original mapping.")
 
-                all_results.update(batch_result)
-                save_refinement_checkpoint(checkpoint_path, all_results)
-                print(f"      ✅ Batch {current_batch} saved ({len(batch_result)} items).")
-                break
-
-            except Exception as error:
-                retryable = is_retryable_error(error)
-                parse_error = isinstance(error, (json.JSONDecodeError, ValueError, TypeError))
-                should_retry = (retryable or parse_error) and attempt < MAX_RETRIES
-                print(f"      ⚠️ Batch {current_batch} attempt {attempt}/{MAX_RETRIES} failed: {error}")
-
-                if should_retry:
-                    delay = min(MAX_RETRY_SECONDS, BASE_RETRY_SECONDS * (2 ** (attempt - 1)))
-                    delay += random.uniform(0, 0.5)
-                    print(f"      🔁 Retrying in {delay:.1f}s...")
-                    time.sleep(delay)
-                    continue
-
-                print(f"      ❌ Batch {current_batch} failed after {attempt} attempt(s).")
-                break
-            
     return all_results
 
 # --- MAIN ENGINE ---

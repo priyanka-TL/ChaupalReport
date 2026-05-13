@@ -4,7 +4,6 @@ import time
 import random
 import re
 import unicodedata
-from difflib import SequenceMatcher
 from tqdm import tqdm
 from dotenv import load_dotenv
 from llm_provider import LLMProvider
@@ -60,29 +59,34 @@ THEME_PATTERN_RULES = {
         r"transfer certificate", r"document", r"id card", r"certificate"
     ],
     "Poverty and Economic Barriers": [
-        r"\bpoverty\b", r"poor financial", r"financial", r"\bno money\b", r"economic",
-        r"labou?r", r"wages?", r"income", r"brick kiln", r"field work"
+        r"\bpoverty\b", r"poor financial", r"financial", r"\bno money\b", r"lack of money",
+        r"economic", r"labou?r", r"wages?", r"income", r"brick kiln", r"field work",
+        r"\bthe poor\b", r"\bdebt\b"
     ],
     "Child Marriage Issue": [
         r"child marriage", r"early marriage", r"marr(y|ied|iage).*18", r"under\s*18", r"marry.*young"
     ],
     "Distance and Accessibility Issues": [
         r"\bdistance\b", r"far away", r"far from school", r"transport", r"bicycle", r"road",
-        r"access", r"commut", r"nearby village"
+        r"access", r"commut", r"nearby village", r"anganwadi.*far", r"far.*anganwadi"
     ],
     "Parental Attitudes & Socio-Cultural": [
         r"parent", r"not aware", r"awareness", r"mindset", r"discrimination", r"household chore",
-        r"domestic work", r"girls? .*not allowed", r"importance of education", r"socio"
+        r"household work", r"domestic work", r"girls? .*not allowed", r"importance of education",
+        r"socio", r"do not send", r"not send.*school", r"going out.*house", r"prevent.*school",
+        r"not feel.*stud", r"not attend.*school"
     ],
     "School Infrastructure & Facility": [
         r"toilet", r"drinking water", r"mid[- ]?day meal", r"uniform", r"books?", r"anganwadi",
-        r"infrastructure", r"facility", r"school building", r"no school"
+        r"infrastructure", r"facility", r"school building", r"no school", r"no provision",
+        r"higher secondary"
     ],
     "Teacher Capacity & Quality": [
         r"teacher", r"does not teach", r"shortage of teachers", r"teacher absentee", r"teaching quality"
     ],
     "Safety Issues": [
-        r"harass", r"unsafe", r"safety", r"fear", r"violence", r"molest", r"kidney"
+        r"harass", r"unsafe", r"safety", r"fear", r"violence", r"molest", r"kidney",
+        r"go.*alone", r"walk.*alone", r"travel.*alone"
     ],
     "Substance Abuse & Addiction": [
         r"alcohol", r"drug", r"addiction", r"gambl", r"drunk", r"mobile addiction"
@@ -122,15 +126,8 @@ def is_retryable_error(error):
 def save_progress(output_csv, batch_df):
     if batch_df.empty:
         return
-
-    if os.path.exists(output_csv):
-        existing_df = pd.read_csv(output_csv)
-        merged_df = pd.concat([existing_df, batch_df], ignore_index=True)
-        merged_df = merged_df.drop_duplicates(subset=["Original"], keep="last")
-    else:
-        merged_df = batch_df.copy()
-
-    merged_df.to_csv(output_csv, index=False)
+    file_exists = os.path.exists(output_csv)
+    batch_df.to_csv(output_csv, mode='a', index=False, header=not file_exists)
 
 
 def normalize_for_match(text):
@@ -225,44 +222,85 @@ def derive_concept_from_text(text, theme):
     return canonical
 
 
-def fuzzy_match_from_reference(text, reference_df, threshold):
+def build_reference_lookup(reference_df):
+    """Build an O(1) normalized exact-match dict from reference_df.
+    Replaces the O(n) SequenceMatcher scan that caused quadratic slowdown.
+    Fully vectorised - safe to call on tens of thousands of existing rows at startup."""
     if reference_df.empty:
-        return None
+        return {}
 
-    norm_text = normalize_for_match(text)
-    text_len = len(norm_text)
-    if text_len == 0:
-        return None
+    df = reference_df.copy()
 
-    candidates = []
-    for _, row in reference_df.iterrows():
-        original = str(row.get("Original", "")).strip()
-        theme = normalize_theme_name(row.get("Theme"))
-        concept = row.get("Merged_Concept", "")
-        if not original or not theme:
-            continue
-        norm_original = normalize_for_match(original)
-        if not norm_original:
-            continue
-        if abs(len(norm_original) - text_len) > 120:
-            continue
-        score = SequenceMatcher(None, norm_text, norm_original).ratio()
-        candidates.append((score, theme, str(concept).strip()))
+    # Drop rows where Original is NaN or the string "nan"
+    orig_raw = df["Original"]
+    valid_mask = orig_raw.notna() & orig_raw.astype(str).str.strip().str.lower().ne("nan")
+    df = df[valid_mask].reset_index(drop=True)
+    if df.empty:
+        return {}
 
-    if not candidates:
-        return None
+    # Vectorised normalize_for_match using Unicode escapes to avoid editor curly-quote corruption
+    norms = (
+        df["Original"].astype(str).str.strip()
+        .str.normalize("NFKC")
+        .str.replace("’", "'", regex=False)
+        .str.replace("‘", "'", regex=False)
+        .str.replace("“", '"', regex=False)
+        .str.replace("”", '"', regex=False)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+        .str.lower()
+    )
 
-    best_score, best_theme, best_concept = max(candidates, key=lambda item: item[0])
-    if best_score >= threshold:
-        concept = best_concept if best_concept and best_concept.lower() != "nan" else derive_concept_from_text(text, best_theme)
-        return {
-            "Theme": best_theme,
-            "Merged_Concept": clean_merged_concept(concept),
-            "Confidence": round(float(best_score), 4),
-            "Mapping_Source": "fuzzy_reference",
+    # Fast theme path: most themes in existing CSVs are already canonical strings
+    canonical_set = set(CANONICAL_THEMES)
+    themes_raw = df["Theme"].astype(str).str.strip()
+    themes = themes_raw.where(themes_raw.isin(canonical_set))
+    fallback_idx = themes[themes.isna()].index
+    if len(fallback_idx) > 0:
+        themes.loc[fallback_idx] = df.loc[fallback_idx, "Theme"].apply(normalize_theme_name)
+
+    # Vectorised concept cleaning (avoids calling clean_merged_concept per row)
+    concepts = df.get("Merged_Concept", pd.Series([""] * len(df))).fillna("").astype(str)
+    concepts = (
+        concepts.str.strip()
+        .str.strip('"')
+        .str.strip("'")
+        .str.replace(r"\s+", " ", regex=True)
+        .str.rstrip(" .,:;")
+        .str.replace(r"^\d+[\.\)\s-]*", "", regex=True)
+        .str.strip()
+    )
+    has_content = concepts.str.len() > 0
+    concepts = (concepts.str[:1].str.upper() + concepts.str[1:]).where(has_content, "Uncategorized")
+
+    confidences = pd.to_numeric(
+        df.get("Confidence", pd.Series([0.9] * len(df))), errors="coerce"
+    ).fillna(0.9)
+
+    # Filter valid rows and build dict from numpy arrays (avoids iterrows overhead)
+    valid = (norms.str.len() > 0) & themes.notna()
+    norms_arr    = norms[valid].to_numpy()
+    themes_arr   = themes[valid].to_numpy()
+    concepts_arr = concepts[valid].to_numpy()
+    confs_arr    = confidences[valid].to_numpy()
+
+    return {
+        norm: {
+            "Theme": str(theme),
+            "Merged_Concept": str(concept),
+            "Confidence": float(conf),
+            "Mapping_Source": "exact_reference",
         }
-
-    return None
+        for norm, theme, concept, conf in zip(norms_arr, themes_arr, concepts_arr, confs_arr)
+    }
+def fuzzy_match_from_reference(text, reference_lookup):
+    """O(1) exact-match lookup. Previously O(n) SequenceMatcher — caused 10+ min gaps."""
+    if not reference_lookup:
+        return None
+    norm_text = normalize_for_match(text)
+    if not norm_text:
+        return None
+    return reference_lookup.get(norm_text)
 
 
 def clean_merged_concept(text):
@@ -386,7 +424,7 @@ def get_ai_mapping(text_batch, type_label):
     return postprocess_mapping_batch(df_batch)
 
 
-def enforce_batch_coverage(current_items, mapped_df, reference_df):
+def enforce_batch_coverage(current_items, mapped_df, reference_lookup):
     mapped_df = mapped_df.copy()
     if mapped_df.empty:
         mapped_df = pd.DataFrame(columns=["Original", "Theme", "Merged_Concept", "Confidence", "Mapping_Source"])
@@ -398,7 +436,7 @@ def enforce_batch_coverage(current_items, mapped_df, reference_df):
         concept = clean_merged_concept(mapped_df.at[index, "Merged_Concept"])
 
         if not theme:
-            fuzzy = fuzzy_match_from_reference(original, reference_df, FUZZY_THEME_MIN_SCORE)
+            fuzzy = fuzzy_match_from_reference(original, reference_lookup)
             if fuzzy:
                 theme = fuzzy["Theme"]
                 concept = fuzzy["Merged_Concept"]
@@ -439,7 +477,7 @@ def enforce_batch_coverage(current_items, mapped_df, reference_df):
             )
             continue
 
-        fuzzy = fuzzy_match_from_reference(original, reference_df, FUZZY_THEME_MIN_SCORE)
+        fuzzy = fuzzy_match_from_reference(original, reference_lookup)
         if fuzzy:
             filled_rows.append(
                 {
@@ -479,14 +517,15 @@ def process_file(input_csv, output_csv, type_label):
     unique_list = df_unique['text'].dropna().unique().tolist()
 
     already_processed = set()
-    reference_df = pd.DataFrame(columns=["Original", "Theme", "Merged_Concept", "Confidence", "Mapping_Source"])
+    reference_lookup = {}
     if os.path.exists(output_csv):
         try:
             existing_output = pd.read_csv(output_csv)
             if 'Original' in existing_output.columns:
-                reference_df = postprocess_mapping_batch(existing_output)
+                existing_clean = postprocess_mapping_batch(existing_output)
                 already_processed = set(existing_output['Original'].dropna().astype(str).tolist())
-                print(f"♻️ Resume mode: found {len(already_processed)} already processed {type_label} rows in {output_csv}")
+                reference_lookup = build_reference_lookup(existing_clean)
+                print(f"♻️ Resume mode: found {len(already_processed)} already processed {type_label} rows in {output_csv} ({len(reference_lookup)} in lookup)")
         except Exception as read_error:
             print(f"⚠️ Could not read existing output for resume: {read_error}")
 
@@ -529,12 +568,23 @@ def process_file(input_csv, output_csv, type_label):
                 mapped_df = pd.DataFrame()
                 break
 
-        mapped_df = enforce_batch_coverage(current_items, mapped_df, reference_df)
+        mapped_df = enforce_batch_coverage(current_items, mapped_df, reference_lookup)
 
         if not mapped_df.empty:
             save_progress(output_csv, mapped_df)
-            reference_df = pd.concat([reference_df, mapped_df], ignore_index=True)
-            reference_df = reference_df.drop_duplicates(subset=["Original"], keep="last")
+            for _, row in mapped_df.iterrows():
+                orig = str(row.get("Original", "")).strip()
+                norm = normalize_for_match(orig)
+                theme = normalize_theme_name(row.get("Theme"))
+                concept = row.get("Merged_Concept", "")
+                conf = row.get("Confidence", 0.9)
+                if norm and theme:
+                    reference_lookup[norm] = {
+                        "Theme": theme,
+                        "Merged_Concept": clean_merged_concept(str(concept)),
+                        "Confidence": float(conf) if str(conf).strip() else 0.9,
+                        "Mapping_Source": "exact_reference",
+                    }
             print(f"      ✅ Batch {current_batch} done. Saved {len(mapped_df)} rows to {output_csv}.")
         else:
             print(f"      ⚠️ Batch {current_batch} produced no usable rows.")
