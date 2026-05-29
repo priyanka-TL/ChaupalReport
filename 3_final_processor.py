@@ -1,4 +1,5 @@
 import pandas as pd
+import io
 import re
 import os
 import time
@@ -88,10 +89,27 @@ def save_refinement_checkpoint(checkpoint_path, results):
 
 def _extract_json_block(text):
     cleaned = str(text).replace('```json', '').replace('```', '').strip()
-    start = cleaned.find('{')
-    end = cleaned.rfind('}')
-    if start != -1 and end != -1 and end > start:
+
+    obj_start = cleaned.find('{')
+    arr_start = cleaned.find('[')
+
+    starts = [idx for idx in (obj_start, arr_start) if idx != -1]
+    if not starts:
+        return cleaned
+
+    start = min(starts)
+    opener = cleaned[start]
+    closer = '}' if opener == '{' else ']'
+    end = cleaned.rfind(closer)
+    if end != -1 and end > start:
         return cleaned[start:end + 1]
+
+    # Fallback: if we can't find the matching closer for first opener,
+    # still try object extraction because many responses are object-shaped.
+    obj_end = cleaned.rfind('}')
+    if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
+        return cleaned[obj_start:obj_end + 1]
+
     return cleaned
 
 
@@ -113,8 +131,80 @@ def _sanitize_json(raw):
     return fixed
 
 
+def _normalize_refinement_key(text):
+    if text is None:
+        return ""
+
+    normalized = str(text)
+    normalized = normalized.replace("\u2019", "'").replace("\u2018", "'")
+    normalized = normalized.replace('"', '').replace('“', '').replace('”', '')
+    normalized = re.sub(r'^\s*\d+[\)\.\-]\s*', '', normalized)
+    normalized = re.sub(r'\s+', ' ', normalized).strip().lower()
+    return normalized
+
+
+def _resolve_batch_item(candidate_key, batch_lookup):
+    normalized = _normalize_refinement_key(candidate_key)
+    if not normalized:
+        return None
+
+    direct = batch_lookup.get(normalized)
+    if direct:
+        return direct
+
+    best_match = None
+    best_score = 0.0
+    for known_key in batch_lookup:
+        if abs(len(known_key) - len(normalized)) > 30:
+            continue
+        score = SequenceMatcher(None, normalized, known_key).ratio()
+        if score > best_score:
+            best_score = score
+            best_match = known_key
+
+    if best_match and best_score >= 0.93:
+        return batch_lookup[best_match]
+
+    return None
+
+
+def _iter_refinement_entries(parsed):
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get('results'), list):
+            for row in parsed['results']:
+                if not isinstance(row, dict):
+                    continue
+                key = (
+                    row.get('original')
+                    or row.get('input')
+                    or row.get('source')
+                    or row.get('text')
+                    or row.get('item')
+                )
+                yield key, row
+            return
+
+        for key, value in parsed.items():
+            yield key, value
+        return
+
+    if isinstance(parsed, list):
+        for row in parsed:
+            if not isinstance(row, dict):
+                continue
+            key = (
+                row.get('original')
+                or row.get('input')
+                or row.get('source')
+                or row.get('text')
+                or row.get('item')
+            )
+            yield key, row
+
+
 def _parse_refinement_response(text, batch):
     raw_json = _extract_json_block(text)
+    batch_lookup = {_normalize_refinement_key(item): item for item in batch}
 
     # Try three parsing strategies, most strict first:
     #  1. Direct json.loads            — correct JSON
@@ -134,18 +224,30 @@ def _parse_refinement_response(text, batch):
         except Exception as exc:
             last_err = exc
 
-    if not isinstance(parsed, dict):
-        raise ValueError(f"Refinement response is not a JSON object: {last_err}")
+    if not isinstance(parsed, (dict, list)):
+        raise ValueError(f"Refinement response is not a supported JSON shape: {last_err}")
 
     valid = {}
-    for item in batch:
-        value = parsed.get(item)
+    for raw_key, value in _iter_refinement_entries(parsed):
+        resolved_item = _resolve_batch_item(raw_key, batch_lookup)
+        if not resolved_item:
+            continue
+
         if not isinstance(value, dict):
             continue
-        concept = str(value.get('concept', '')).strip()
-        theme = str(value.get('theme', '')).strip()
+        concept = str(
+            value.get('concept')
+            or value.get('merged_concept')
+            or value.get('Merged_Concept')
+            or ''
+        ).strip()
+        theme = str(
+            value.get('theme')
+            or value.get('Theme')
+            or ''
+        ).strip()
         if concept and theme:
-            valid[item] = {'concept': concept, 'theme': theme}
+            valid[resolved_item] = {'concept': concept, 'theme': theme}
 
     if not valid:
         raise ValueError("No valid refinement mappings found in response")
@@ -182,23 +284,95 @@ def _extract_partial_results(raw_text, batch):
     salvage whatever the model did finish generating.
     """
     results = {}
-    batch_set = set(batch)
+    batch_lookup = {_normalize_refinement_key(item): item for item in batch}
     key_val_pat = re.compile(r'"((?:[^"\\]|\\.)*?)"\s*:\s*\{([^{}]*?)\}', re.DOTALL)
     concept_pat = re.compile(r'"concept"\s*:\s*"((?:[^"\\]|\\.)*?)"', re.DOTALL)
     theme_pat = re.compile(r'"theme"\s*:\s*"((?:[^"\\]|\\.)*?)"', re.DOTALL)
     for m in key_val_pat.finditer(raw_text):
         key = m.group(1)
-        inner = m.group(2)
-        if key not in batch_set:
+        resolved_item = _resolve_batch_item(key, batch_lookup)
+        if not resolved_item:
             continue
+        inner = m.group(2)
         cm = concept_pat.search(inner)
         tm = theme_pat.search(inner)
         if cm and tm:
             concept = cm.group(1).strip()
             theme = tm.group(1).strip()
             if concept and theme:
-                results[key] = {'concept': concept, 'theme': theme}
+                results[resolved_item] = {'concept': concept, 'theme': theme}
     return results
+
+
+def _is_overly_verbose_concept(text):
+    value = str(text or '').strip()
+    if not value:
+        return True
+
+    words = value.split()
+    lower = value.lower()
+    return (
+        len(value) > 90
+        or len(words) > 12
+        or '"' in value
+        or value.count(',') >= 2
+        or lower.startswith(('we ', 'when ', 'all the ', 'to resolve ', 'the didi '))
+    )
+
+
+def _canonical_solution_heading(label, sample_texts=None):
+    label_text = str(label or '').strip()
+    sample_blob = " ".join(str(item) for item in (sample_texts or []))
+    combined = f"{label_text} {sample_blob}".lower()
+
+    if (
+        any(term in combined for term in ['aadhaar', 'aadhar', 'birth certificate', 'document', 'documents', 'admission card'])
+        or 'admission related problem' in combined
+        or ('admission' in combined and any(term in combined for term in ['certificate', 'block', 'correction']))
+    ):
+        return 'Facilitating legal document creation/correction (Aadhaar/Birth Certificate)'
+    if any(term in combined for term in ['send children to school', 'regular school', 'daily school', 'school every day', 'attendance', 'enroll', 'enrol']):
+        return 'Promoting regular school attendance and enrollment'
+    if any(term in combined for term in ['teacher', 'headmaster', 'school staff', 'talk to teacher', 'meet teacher']):
+        return 'Community engagement with teachers for issue resolution'
+
+    if not label_text:
+        return 'Community-led education support action'
+
+    if _is_overly_verbose_concept(label_text):
+        trimmed = re.sub(r'\s+', ' ', label_text).strip(' .,:;')
+        trimmed_words = trimmed.split()
+        return " ".join(trimmed_words[:10]).strip(' .,:;')
+
+    return label_text
+
+
+def _select_display_concept(group, concept_column='Merged_Concept', text_column='Solutions'):
+    if group.empty:
+        return 'Uncategorized'
+
+    concepts = group[concept_column].fillna('').astype(str).str.strip()
+    concepts = concepts[concepts != '']
+    if concepts.empty:
+        return 'Uncategorized'
+
+    frequencies = concepts.value_counts()
+
+    def _score(candidate):
+        return (
+            1 if _is_overly_verbose_concept(candidate) else 0,
+            -int(frequencies.get(candidate, 0)),
+            len(candidate),
+        )
+
+    ranked = sorted(frequencies.index.tolist(), key=_score)
+    best = ranked[0]
+
+    sample_texts = []
+    if text_column in group.columns:
+        sample_texts = group[text_column].dropna().astype(str).head(5).tolist()
+
+    return _canonical_solution_heading(best, sample_texts=sample_texts)
 
 
 def _run_refinement_batch(batch, type_label, batch_label, max_retries=None):
@@ -508,10 +682,25 @@ def assign_concept_groups(df, concept_column='Merged_Concept'):
         else:
             parent[root_a] = root_b
 
-    for i, key_a in enumerate(keys):
-        for key_b in keys[i + 1:]:
-            if _are_concepts_similar(key_a, key_b):
-                union(key_a, key_b)
+    # Token-blocking: build inverted index so only pairs sharing ≥1 token are compared.
+    # Reduces O(n²) to O(n × avg_bucket_size) — essential for large concept sets.
+    from collections import defaultdict
+    token_index = defaultdict(list)
+    for key in keys:
+        for token in _tokenize_concept_key(key):
+            token_index[token].append(key)
+
+    compared = set()
+    for key_a in keys:
+        for token in _tokenize_concept_key(key_a):
+            for key_b in token_index[token]:
+                if key_b == key_a:
+                    continue
+                pair = (min(key_a, key_b), max(key_a, key_b))
+                if pair not in compared:
+                    compared.add(pair)
+                    if _are_concepts_similar(key_a, key_b):
+                        union(key_a, key_b)
 
     group_map = {key: find(key) for key in keys}
     temp['Concept_Group'] = temp['Concept_Key'].map(group_map)
@@ -752,9 +941,19 @@ def generate_report():
     df_s['Agency'] = df_s['Solutions'].apply(categorize_agency)
 
     # --- AI REFINEMENT STEP ---
-    # Get top 200 concepts to refine (Increased from 100 to catch more variations)
-    top_chal = df_c['Merged_Concept'].value_counts().head(200).index.tolist()
-    top_sol = df_s['Merged_Concept'].value_counts().head(200).index.tolist()
+    def _collect_concepts_for_refinement(df, top_n=400):
+        """Top N by frequency + all 'Other Factors' concepts for re-theming."""
+        freq_top = df['Merged_Concept'].value_counts().head(top_n).index.tolist()
+        other_factors = (
+            df[df['Theme'] == 'Other Factors']['Merged_Concept']
+            .dropna().unique().tolist()
+        )
+        seen = set(freq_top)
+        extras = [c for c in other_factors if c not in seen]
+        return freq_top + extras
+
+    top_chal = _collect_concepts_for_refinement(df_c)
+    top_sol = _collect_concepts_for_refinement(df_s)
     
     # Refine Challenges
     chal_updates = refine_concepts_with_ai(top_chal, "Challenge")
@@ -1213,7 +1412,11 @@ def generate_report():
             grouped_solutions = []
             for concept_key, group in valid_solutions.groupby('Concept_Group'):
                 mention_count = len(group)
-                display_concept = group['Merged_Concept'].value_counts().idxmax()
+                display_concept = _select_display_concept(
+                    group,
+                    concept_column='Merged_Concept',
+                    text_column='Solutions',
+                )
                 grouped_solutions.append((display_concept, mention_count, concept_key))
 
             top_solutions = sorted(grouped_solutions, key=lambda item: item[1], reverse=True)[:5]
@@ -1361,7 +1564,20 @@ def generate_report():
                 
                 valid_mask = theme_s_rows['Merged_Concept'].apply(is_valid_solution)
                 valid_s_rows = theme_s_rows[valid_mask]
-                top_solutions = valid_s_rows['Merged_Concept'].value_counts().head(2).index.tolist()
+                grouped_rows = assign_concept_groups(valid_s_rows, concept_column='Merged_Concept')
+                grouped_solutions = []
+                for concept_key, group in grouped_rows.groupby('Concept_Group'):
+                    mention_count = len(group)
+                    display_concept = _select_display_concept(
+                        group,
+                        concept_column='Merged_Concept',
+                        text_column='Solutions',
+                    )
+                    grouped_solutions.append((display_concept, mention_count))
+
+                top_solutions = [
+                    name for name, _ in sorted(grouped_solutions, key=lambda item: item[1], reverse=True)[:2]
+                ]
             
             # Write Challenges
             if top_challenges:
