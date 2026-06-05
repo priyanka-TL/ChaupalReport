@@ -7,6 +7,8 @@ This project generates two outputs from raw Shiksha Chaupal data:
 
 The pipeline cleans participant demographics, explodes text responses, uses AI for theme mapping and semantic deduplication, then builds section-wise analytics and insights.
 
+Current branch for the chaupal6: Chaupal6WithOpenRouter
+
 ## Project Flow
 
 1. **`0_data_cleaner.py`**

@@ -20,6 +20,10 @@ __pycache__/
 # VS Code
 .vscode/
 
+# Local env files with real credentials (use .env.sample as reference)
+.env
+.env.local
+
 # Virtual environments
 sc_report_env/
 venv/

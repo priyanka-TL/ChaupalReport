@@ -7,6 +7,7 @@ import urllib.parse
 import urllib.request
 
 import boto3
+from openai import OpenAI
 
 
 class LLMProvider:
@@ -24,6 +25,10 @@ class LLMProvider:
         self.gemini_model = self._normalize_gemini_model(raw_gemini_model)
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
 
+        self.openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+        self.openrouter_model = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash")
+        self.openrouter_client = None
+
         self.claude_client = None
         if self.provider == "claude":
             self.claude_client = boto3.client(
@@ -35,8 +40,15 @@ class LLMProvider:
         elif self.provider == "gemini":
             if not self.gemini_api_key:
                 raise ValueError("GEMINI_API_KEY is required when LLM_PROVIDER=gemini")
+        elif self.provider == "openrouter":
+            if not self.openrouter_api_key:
+                raise ValueError("OPENROUTER_API_KEY is required when LLM_PROVIDER=openrouter")
+            self.openrouter_client = OpenAI(
+                api_key=self.openrouter_api_key,
+                base_url="https://openrouter.ai/api/v1",
+            )
         else:
-            raise ValueError("Unsupported LLM_PROVIDER. Use 'claude' or 'gemini'.")
+            raise ValueError("Unsupported LLM_PROVIDER. Use 'claude', 'gemini', or 'openrouter'.")
 
         self.call_counter = 0
         self.log_file = os.getenv("LLM_CALL_LOG_FILE", "ai_calls.log")
@@ -46,7 +58,11 @@ class LLMProvider:
         return self.call_counter
 
     def _current_model(self):
-        return self.claude_model_id if self.provider == "claude" else self.gemini_model
+        if self.provider == "claude":
+            return self.claude_model_id
+        if self.provider == "openrouter":
+            return self.openrouter_model
+        return self.gemini_model
 
     def _append_log(self, payload):
         try:
@@ -66,6 +82,8 @@ class LLMProvider:
     def describe(self):
         if self.provider == "claude":
             return f"claude ({self.claude_model_id})"
+        if self.provider == "openrouter":
+            return f"openrouter ({self.openrouter_model})"
         return f"gemini ({self.gemini_model})"
 
     def generate_text(self, prompt, max_tokens=4000, temperature=0, thinking_budget=None):
@@ -126,6 +144,50 @@ class LLMProvider:
                 }
             )
             return output_text
+
+        if self.provider == "openrouter":
+            try:
+                response = self.openrouter_client.chat.completions.create(
+                    model=self.openrouter_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    extra_headers={
+                        "HTTP-Referer": "chaupal-report-pipeline",
+                        "X-Title": "ChaupalReport",
+                    },
+                )
+                output_text = response.choices[0].message.content.strip()
+                duration = time.time() - started_at
+                print(f"✅ AI Call #{call_id} completed in {duration:.2f}s", flush=True)
+                self._append_log(
+                    {
+                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "event": "success",
+                        "call_id": call_id,
+                        "provider": self.provider,
+                        "model": self._current_model(),
+                        "duration_seconds": round(duration, 3),
+                        "response_chars": len(output_text),
+                    }
+                )
+                return output_text
+            except Exception as error:
+                duration = time.time() - started_at
+                error_message = str(error)
+                print(f"❌ AI Call #{call_id} failed in {duration:.2f}s: {error_message}", flush=True)
+                self._append_log(
+                    {
+                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "event": "error",
+                        "call_id": call_id,
+                        "provider": self.provider,
+                        "model": self._current_model(),
+                        "duration_seconds": round(duration, 3),
+                        "error": error_message,
+                    }
+                )
+                raise
 
         endpoint = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
