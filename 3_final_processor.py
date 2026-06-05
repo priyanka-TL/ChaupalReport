@@ -60,6 +60,12 @@ JUNK_CONCEPTS = frozenset({
     "uncategorized", "vague", "incomplete statement", "n/a", "none", "",
     "vague or unspecified educational issue", "uncategorized/irrelevant data",
 })
+# Concepts that are noise and should never appear in the final report
+NOISE_CONCEPT_RE = re.compile(
+    r'non.?educational|irrelevant.statement|not.educational|garbled|nonsense',
+    re.IGNORECASE,
+)
+
 VALID_THEMES = frozenset({
     "Poverty and Economic Barriers",
     "Legal Document-linked Barriers",
@@ -72,6 +78,67 @@ VALID_THEMES = frozenset({
     "Substance Abuse & Addiction",
     "Other Factors",
 })
+
+# Deterministic retheme: (concept_keyword_pattern, correct_theme)
+# Applied BEFORE AI refinement to fix systematic Stage 2 misclassifications.
+RETHEME_RULES = [
+    (re.compile(
+        r'aadhaar|birth[\s\-]?cert|caste[\s\-]?cert|transfer[\s\-]?cert|'
+        r'legal[\s\-]?doc|documentation|no[\s]?doc|document.*admission|'
+        r'without.*doc|lacking.*doc',
+        re.IGNORECASE),
+     'Legal Document-linked Barriers'),
+    (re.compile(
+        r'\bchild[\s\-]?marri|\bearly[\s\-]?marri|marriage[\s\-]?prevent|'
+        r'married.*educat|girl.*married|betrothal|dowry.*educat',
+        re.IGNORECASE),
+     'Child Marriage Issue'),
+    (re.compile(
+        r'unsafe.*route|harassment.*way|eve[\s\-]?teas|molestation|'
+        r'sexual.*harass|fear.*going.*school|attack.*way|danger.*route',
+        re.IGNORECASE),
+     'Safety Issues'),
+    (re.compile(
+        r'\balcohol|\bdrug[\s\-]?use|\bsubstance[\s\-]?abuse|gambling|'
+        r'mobile.*addict|tobacco.*school|\bintox',
+        re.IGNORECASE),
+     'Substance Abuse & Addiction'),
+    (re.compile(
+        r'teacher[\s\-]?absent|teacher[\s\-]?shortage|ghost[\s\-]?teacher|'
+        r'no[\s]?teacher|untrained.*teacher|teacher.*quality',
+        re.IGNORECASE),
+     'Teacher Capacity & Quality'),
+]
+
+# Solution concepts that are problem-framed and should be excluded from the solutions report
+# (e.g. "Poverty Preventing Education" appears in solutions because participants described
+# the barrier, not an action — these pollute the solution ecosystem section)
+_PROBLEM_SOLUTION_RE = re.compile(
+    r'\bpreventing\s+education\b|\bblocking\s+education\b|\bpreventing\s+school\b|'
+    r'\bpreventing\s+schooling\b|\bhardship\s+preventing\b',
+    re.IGNORECASE,
+)
+
+
+def apply_retheme_rules(df):
+    """Deterministic theme correction based on concept keyword patterns.
+    Runs before AI refinement to fix systematic Stage 2 misclassifications.
+    """
+    if df.empty or 'Merged_Concept' not in df.columns:
+        return df
+    fixed = 0
+    df = df.copy()
+    for pattern, correct_theme in RETHEME_RULES:
+        mask = (
+            df['Merged_Concept'].fillna('').apply(lambda x: bool(pattern.search(x))) &
+            (df['Theme'] != correct_theme)
+        )
+        if mask.any():
+            fixed += int(mask.sum())
+            df.loc[mask, 'Theme'] = correct_theme
+    if fixed:
+        print(f"   🔧 Deterministic retheme: corrected {fixed} misclassified rows.", flush=True)
+    return df
 
 
 def is_retryable_error(error):
@@ -713,31 +780,87 @@ def normalize_concepts_per_theme(df, type_label):
                     f"If a concept below is semantically equivalent to ANY label above, map it to that EXACT label.\n"
                 )
 
-            prompt = f"""You are normalizing concept labels for the education theme: "{theme}".
+            # Theme-specific critical merge rules injected verbatim into the prompt
+            theme_specific_rules = ""
+            if theme == "Legal Document-linked Barriers":
+                theme_specific_rules = """
+⚠️ LEGAL DOCUMENTS THEME — MANDATORY GROUPING RULE:
+ALL specific document-type barriers MUST collapse into ONE canonical label: "Lack of Legal Documents For Enrollment"
+This includes EVERY variant about missing or problematic documents:
+  "Aadhaar Card Issues" = "Aadhaar Card Problem" = "No Aadhaar" = "Lack of Aadhaar Card"
+  = "Birth Certificate Issues" = "No Birth Certificate" = "Lack of Birth Certificate"
+  = "Caste Certificate Issues" = "No Caste Certificate"
+  = "Transfer Certificate Issues" = "No Transfer Certificate"
+  = "Legal Document Issues For Admission" = "Documentation Issues For Enrollment"
+  = "Lack of Legal Documents" = "No Documents For Admission"
+  → ALL → "Lack of Legal Documents For Enrollment"
+Do NOT keep Aadhaar and Birth Certificate as separate entries. They are the SAME barrier.
+"""
+            elif theme == "Child Marriage Issue":
+                theme_specific_rules = """
+⚠️ CHILD MARRIAGE THEME — MANDATORY GROUPING RULES:
+All concepts in this theme relate to CHILD MARRIAGE. Never rename them to "Poverty Preventing Education" or any Poverty-themed label.
+
+GROUP 1 — Barrier (marriage stopping education):
+  "Child Marriage Preventing Education" = "Early Marriage Preventing Education"
+  = "Child Marriage Stopping Studies" = "Girl Married Before 18 Preventing Education"
+  = "Marriage Due To Poverty" = "Child Marriage Due To Poverty" = "Early Forced Marriage"
+  = "Marital Responsibilities Preventing Education" = "Child Marriage Issue"
+  = "Child Marriage Occurrence" = "Child Marriage Practice"
+  → ALL → "Child Marriage Preventing Education"
+
+GROUP 2 — Dowry:
+  "Dowry System Preventing Education" = "Dowry System Leading To Child Marriage" = "Dowry Burden"
+  → ALL → "Dowry Preventing Girls Education"
+
+GROUP 3 — Action / Commitment to stop child marriage:
+  "Stopping Child Marriage" = "Preventing Early Marriage" = "Community Against Child Marriage"
+  = "Preventing Child Marriage" = "Promoting Marriage After 18" = "Legal Action For Child Marriage"
+  → ALL → "Preventing Child Marriage"
+
+GROUP 4 — Causes / Discussion (does not fit Groups 1–3):
+  "Causes of Child Marriage" = "Discussion On Child Marriage" = "Child Marriage Health Risks"
+  = "Parental Practice Of Child Marriage" = "Perceived Benefits Of Early Child Marriage"
+  = "Social Pressure For Child Marriage" = "Guardian Promoting Child Marriage"
+  = "Family Encouragement Of Child Marriage" = "Parental Illiteracy Leading To Child Marriage"
+  → ALL → "Cultural Acceptance Of Child Marriage"
+"""
+            elif theme == "Safety Issues":
+                theme_specific_rules = """
+⚠️ SAFETY THEME — MANDATORY GROUPING RULE:
+ALL variants about unsafe routes / harassment / molestation → "Unsafe And Harassing Route To School"
+  "Unsafe Route To School" = "Harassment On The Way To School" = "Eve-Teasing On Route"
+  = "Fear Of Safety Going To School" = "Molestation Preventing Attendance"
+  = "Girls Fear Going Out" = "Sexual Harassment Preventing Education"
+  → ALL → "Unsafe And Harassing Route To School"
+"""
+            elif theme == "Parental Attitudes & Socio-Cultural":
+                theme_specific_rules = """
+⚠️ PARENTAL ATTITUDES THEME — MANDATORY GROUPING RULES:
+1. All "parents not interested / don't care / apathetic / not committed to education" → "Lack of Parental Commitment To Education"
+2. All "parents unaware of education importance / lack awareness" → "Lack of Parental Education Awareness"
+3. All "domestic work / household chores / girls doing home work" → "Domestic Work Priority"
+4. All "parental dropout decision / general dropout / no reason given" → "General School Dropout"
+These four groups MUST NOT be merged with each other.
+"""
+
+            prompt = f"""You are normalizing concept labels ONLY within the education theme: "{theme}".
 
 {anchor_block}
-TASK: For each concept below, decide its canonical (standard) label.
+{theme_specific_rules}
+TASK: For each concept below, map it to a canonical label for THIS THEME ONLY.
 
-CRITICAL MERGE RULES — these MUST be collapsed into ONE label:
-- Intent-equivalent phrases → SAME label, even if wording is completely different:
-  * "Parents are not interested in sending children to school"
-    = "Lack of parental commitment towards education"
-    = "Parents don't care about children's studies"
-    = "Parental indifference to education"
-    → ONE canonical: "Lack of Parental Commitment To Education"
-  * "Poverty Preventing Education" = "Financial Hardship Preventing Education" = "Child Labour Due To Poverty" → "Poverty Preventing Education"
-  * "Early Marriage Preventing Education" = "Child Marriage Preventing Education" = "Early Child Marriage" → "Child Marriage Preventing Education"
-  * "Household Chores Preventing Education" = "Domestic Work Priority For Girls" = "Girls Doing Home Work" → "Domestic Work Priority"
-  * "Lack of Awareness About Education" = "Parental Indifference To Education" = "Parents Do Not Value Education" = "No Awareness Of Education Importance" → "Lack of Parental Education Awareness"
-  * "Lack of Legal Documentation Aadhaar" = "Lack of Aadhaar Card" = "No Aadhaar For Enrollment" → "Aadhaar Card Issues"
-  * "General Dropout Without Stated Reason" = "General School Dropout" = "Dropout Due To Parental Decision" → "Parental Decision School Dropout"
-  * "Parental Commitment to Education" = "Parental Commitment to Send Children to School" = "Parents Committed to Children's Education" → "Parental Commitment To Education"
-  * "Community Awareness of Education Value" = "Promoting Education Value" = "Raising Education Awareness" → "Community Education Awareness"
+⛔ CRITICAL CONSTRAINT: You are working ONLY within the "{theme}" theme.
+- Do NOT rename any concept to a label from a different theme.
+- "Child Marriage Preventing Education" is a CHILD MARRIAGE concept — never rename it to "Poverty Preventing Education".
+- "Poverty Preventing Education" is a POVERTY concept — do not introduce it here unless this theme is Poverty.
+- "Lack of Legal Documents For Enrollment" is a LEGAL DOCUMENTS concept — do not introduce it in other themes.
+- If a concept does not belong in this theme at all, keep its label unchanged (do not try to force-fit it).
 
 NORMALIZATION RULES:
-- Map ALL semantically equivalent concepts to ONE canonical label.
-- Use the EXACT canonical label from the "ESTABLISHED" list above when applicable.
-- Canonical label: Title Case, 3-8 words, noun phrase, no trailing punctuation.
+- Map ALL semantically equivalent concepts within this theme to ONE canonical label.
+- Use the EXACT canonical label from the CANONICAL LABELS ESTABLISHED list above when applicable.
+- Canonical label: Title Case, 3–8 words, noun phrase, no trailing punctuation.
 - Keep genuinely distinct concepts separate — only merge when meaning is truly equivalent.
 - Do NOT over-merge concepts from different categories of this theme.
 
@@ -829,6 +952,12 @@ def generate_report():
     df_chal_mapped = df_c
     print(f"   ✓ df_c: {len(df_c):,} rows | df_s: {len(df_s):,} rows", flush=True)
 
+    # ── DETERMINISTIC RETHEME (runs before AI — fixes known tagger biases) ───
+    print("\n🔧 Applying deterministic retheme rules...", flush=True)
+    df_c = apply_retheme_rules(df_c)
+    df_s = apply_retheme_rules(df_s)
+    df_chal_mapped = df_c
+
     # ── [3/8] AI REFINEMENT — two-stage ─────────────────────────────────────
     print("\n🤖 [3/8] Running AI concept refinement (global top-200 + per-theme full)...", flush=True)
 
@@ -865,15 +994,32 @@ def generate_report():
     df_s['Theme'] = df_s['Theme'].apply(clean_theme_name)
     df_chal_mapped = df_c
 
-    # ── QUALITY GATE: remove junk concepts and PII before building report ────
-    print("\n🔒 Applying quality filters (junk labels, PII)...", flush=True)
+    # ── QUALITY GATE: remove junk, noise, PII and problem-framed solutions ───
+    print("\n🔒 Applying quality filters (junk, noise, PII, problem-framed solutions)...", flush=True)
     before_c, before_s = len(df_c), len(df_s)
+
+    # 1. Junk concept labels
     df_c = df_c[~df_c['Merged_Concept'].apply(_is_junk_concept)].copy()
     df_s = df_s[~df_s['Merged_Concept'].apply(_is_junk_concept)].copy()
+
+    # 2. PII in concept labels
     df_c = df_c[~df_c['Merged_Concept'].apply(_is_pii_text)].copy()
     df_s = df_s[~df_s['Merged_Concept'].apply(_is_pii_text)].copy()
-    print(f"   Removed {before_c - len(df_c):,} junk/PII challenge rows, "
-          f"{before_s - len(df_s):,} solution rows.", flush=True)
+
+    # 3. Noise concept labels (garbled translations tagged as Non-Educational)
+    df_c = df_c[~df_c['Merged_Concept'].fillna('').apply(lambda x: bool(NOISE_CONCEPT_RE.search(x)))].copy()
+    df_s = df_s[~df_s['Merged_Concept'].fillna('').apply(lambda x: bool(NOISE_CONCEPT_RE.search(x)))].copy()
+
+    # 4. Problem-framed concepts in solutions (e.g. "Poverty Preventing Education" in solutions file)
+    before_s2 = len(df_s)
+    df_s = df_s[~df_s['Merged_Concept'].fillna('').apply(
+        lambda x: bool(_PROBLEM_SOLUTION_RE.search(x))
+    )].copy()
+    problem_sol_dropped = before_s2 - len(df_s)
+
+    print(f"   Removed {before_c - len(df_c):,} junk/noise/PII challenge rows, "
+          f"{before_s - len(df_s):,} solution rows "
+          f"(incl. {problem_sol_dropped} problem-framed solution concepts).", flush=True)
 
     other_pct_c = (df_c['Theme'] == 'Other Factors').mean() * 100
     other_pct_s = (df_s['Theme'] == 'Other Factors').mean() * 100
@@ -884,21 +1030,30 @@ def generate_report():
     df_chal_mapped = df_c
 
     # ── [4/8] GLOBAL CONCEPT GROUPING + CANONICAL LABEL RESOLUTION ───────────
-    print(f"\n🔗 [4/8] TF-IDF semantic clustering (threshold={SIMILARITY_THRESHOLD})...", flush=True)
+    print(f"\n🔗 [4/8] TF-IDF semantic clustering per-theme (threshold={SIMILARITY_THRESHOLD})...", flush=True)
     n_uc = df_c['Merged_Concept'].nunique()
     n_us = df_s['Merged_Concept'].nunique()
     print(f"   Unique challenge concepts: {n_uc:,} | solution concepts: {n_us:,}", flush=True)
 
+    def _cluster_per_theme(df, concept_column='Merged_Concept'):
+        """Run TF-IDF clustering within each theme — prevents cross-theme concept merging."""
+        parts = []
+        for theme, chunk in df.groupby('Theme', sort=False):
+            chunk = assign_concept_groups(chunk.copy(), concept_column=concept_column)
+            chunk = resolve_canonical_labels(chunk, concept_column=concept_column)
+            parts.append(chunk)
+        if not parts:
+            return df
+        return pd.concat(parts, ignore_index=True)
+
     _t4 = time.time()
-    df_c = assign_concept_groups(df_c, concept_column='Merged_Concept')
-    df_c = resolve_canonical_labels(df_c, concept_column='Merged_Concept')
+    df_c = _cluster_per_theme(df_c, concept_column='Merged_Concept')
     n_cg = df_c['Concept_Group'].nunique()
     print(f"   ✓ Challenges: {n_uc:,} labels → {n_cg:,} canonical groups in {time.time()-_t4:.1f}s "
           f"({n_uc - n_cg:,} variants collapsed)", flush=True)
 
     _t4b = time.time()
-    df_s = assign_concept_groups(df_s, concept_column='Merged_Concept')
-    df_s = resolve_canonical_labels(df_s, concept_column='Merged_Concept')
+    df_s = _cluster_per_theme(df_s, concept_column='Merged_Concept')
     n_sg = df_s['Concept_Group'].nunique()
     print(f"   ✓ Solutions: {n_us:,} labels → {n_sg:,} canonical groups in {time.time()-_t4b:.1f}s "
           f"({n_us - n_sg:,} variants collapsed)", flush=True)
@@ -911,8 +1066,8 @@ def generate_report():
         df_raw[col] = pd.to_numeric(df_raw[col], errors='coerce').fillna(0)
     
     TOTAL_PART_STATE = int(df_raw['Participant Count'].sum())
-    NUM_CHAL_STATEMENTS = len(chal_exploded) # Used for % calculations
-    NUM_SOL_STATEMENTS = len(sol_exploded)   # Used for % calculations
+    NUM_CHAL_STATEMENTS = len(df_c) # Used for % calculations (post-filter)
+    NUM_SOL_STATEMENTS = len(df_s)  # Used for % calculations (post-filter)
     NUM_CHAL = NUM_CHAL_STATEMENTS
     NUM_SOL = NUM_SOL_STATEMENTS
     

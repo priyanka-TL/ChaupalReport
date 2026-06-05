@@ -4,6 +4,8 @@ import re
 import time
 import io
 import random
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from dotenv import load_dotenv
 from llm_provider import LLMProvider
@@ -118,6 +120,8 @@ MAX_RETRY_SECONDS = float(os.getenv("LLM_RETRY_MAX_SECONDS", "45"))
 TAGGER_BATCH_SIZE = int(os.getenv("TAGGER_BATCH_SIZE", "25"))
 TAGGER_MAX_TOKENS = int(os.getenv("TAGGER_MAX_TOKENS", "6000"))
 TAGGER_THINKING_BUDGET = int(os.getenv("TAGGER_THINKING_BUDGET", "256"))
+TAGGER_WORKERS = int(os.getenv("TAGGER_WORKERS", "4"))          # parallel API workers
+TAGGER_FLUSH_INTERVAL = int(os.getenv("TAGGER_FLUSH_INTERVAL", "80"))  # flush to disk every N batches
 
 
 def is_retryable_error(error):
@@ -244,9 +248,22 @@ For example: if "Poverty Preventing Education" is in the registry, do NOT write
 "Financial Hardship Preventing Education" or "Economic Barriers To Schooling".
 """
 
+    # Solution-specific instruction to prevent problem-framing in solution concepts
+    solution_framing_block = ""
+    if type_label.lower() == "solution":
+        solution_framing_block = """
+SOLUTION DATASET RULES (apply in addition to all rules above):
+- This dataset contains SOLUTIONS and COMMITMENTS made by participants, not problems.
+- Even if a participant described a barrier, identify the PROPOSED ACTION or COMMITMENT.
+- Merged_Concept must be action-framed: "Parental Commitment To Education", not "Poverty Preventing Education".
+- NEVER use "X Preventing Education" — that is challenge framing. Use "Overcoming X" or "Commitment To X".
+- Negative-start phrases like "Lack of" / "No " / "Poor " are valid ONLY when the solution is to address that lack (e.g., "Ensuring Legal Documents").
+"""
+
     prompt_content = f"""Act as an expert Social Data Analyst for a Bihar education study. Use these THEMES:
 {THEME_KNOWLEDGE_BASE}
 {registry_block}
+{solution_framing_block}
 MANDATORY CLASSIFICATION RULES:
 - "Children not going/attending/coming to school" → classify by the REASON stated or implied:
   If reason is migration/harvest/labour → Poverty and Economic Barriers
@@ -255,12 +272,19 @@ MANDATORY CLASSIFICATION RULES:
   If no document → Legal Document-linked Barriers
   If distance → Distance and Accessibility Issues
   If parental decision/no specific reason → Parental Attitudes & Socio-Cultural
+- THEME PRIORITY RULES (override keyword matching when conflict occurs):
+  * ANY text mentioning Aadhaar / birth certificate / caste certificate / transfer certificate / documentation → Legal Document-linked Barriers (NEVER Poverty)
+  * ANY text mentioning child marriage / early marriage / girl married / betrothal → Child Marriage Issue (NEVER Other Factors)
+  * ANY text mentioning unsafe route / harassment on way / eve-teasing / molestation → Safety Issues
+  * ANY text mentioning alcohol / drugs / substance abuse / gambling / mobile addiction → Substance Abuse & Addiction
+  * Poverty/financial hardship text that ALSO mentions documents → Legal Document-linked Barriers wins
 - NEVER classify as "Other Factors" unless the text is completely non-educational and cannot fit themes 1–9.
 - NEVER use "Uncategorized", "Vague", "Incomplete", "N/A" or any junk as Merged_Concept.
 - NEVER include person names (Kumari, Devi, Singh, Khatoon, Parveen, Siddiqui, Bano, Begum) in Merged_Concept. Extract only the educational issue.
 - "General awareness" → Parental Attitudes & Socio-Cultural
 - "Migration" or "seasonal migration" → Poverty and Economic Barriers
 - Merged_Concept: 3–8 words, title-case, no trailing punctuation.
+- NOISE: If a text is a garbled translation (e.g., food metaphors, nonsensical sentences) with zero educational meaning → Theme: "Other Factors", Merged_Concept: "Non-Educational Irrelevant Statement".
 
 SEMANTIC DEDUPLICATION PROTOCOL (MANDATORY):
 You must merge semantically similar items into a single "Merged_Concept".
@@ -369,7 +393,7 @@ def process_file(input_csv, output_csv, type_label):
             existing_output = pd.read_csv(output_csv)
             if 'Original' in existing_output.columns:
                 already_processed = set(existing_output['Original'].dropna().astype(str).tolist())
-                print(f"♻️ Resume mode: found {len(already_processed)} already processed {type_label} rows in {output_csv}")
+                print(f"♻️ Resume mode: {len(already_processed)} already processed {type_label} rows in {output_csv}")
         except Exception as read_error:
             print(f"⚠️ Could not read existing output for resume: {read_error}")
 
@@ -378,19 +402,18 @@ def process_file(input_csv, output_csv, type_label):
         print(f"✅ Nothing pending for {type_label}. {output_csv} is already up to date.")
         return
 
-    # Pre-cluster similar texts into adjacent positions so they share AI batches.
-    # This is the primary defence against synonym fragmentation across batches.
+    # Pre-cluster similar texts → similar texts share batches → intra-batch AI deduplication fires
     pending_list = _cluster_sort_texts(pending_list, batch_size=TAGGER_BATCH_SIZE)
 
     batch_size = TAGGER_BATCH_SIZE
+    batches = [pending_list[i:i + batch_size] for i in range(0, len(pending_list), batch_size)]
+    total_batches = len(batches)
 
-    total_batches = (len(pending_list) + batch_size - 1) // batch_size
     provider_name = llm_provider.describe() if llm_provider else "unknown-llm"
-    print(f"🔍 Analyzing {len(pending_list)} pending Unique {type_label}s via {provider_name}...")
-    print(f"   Total Batches: {total_batches} | Batch Size: {batch_size}")
+    print(f"🔍 Analyzing {len(pending_list)} pending unique {type_label}s via {provider_name}...")
+    print(f"   Batches: {total_batches} | Batch size: {batch_size} | Workers: {TAGGER_WORKERS}")
 
-    # Cross-batch canonical registry: {concept_label: total_occurrences}
-    # Seed with concepts already saved from a prior run so resume mode benefits too
+    # Seed canonical registry from prior run (resume-mode and cross-run consistency)
     canonical_registry: dict = {}
     if os.path.exists(output_csv):
         try:
@@ -401,52 +424,76 @@ def process_file(input_csv, output_csv, type_label):
         except Exception:
             pass
 
-    for i in tqdm(range(0, len(pending_list), batch_size)):
-        current_batch = (i // batch_size) + 1
-        print(f"   ⏳ Processing Batch {current_batch}/{total_batches}...")
+    # Snapshot the initial registry — all parallel workers get the same starting context.
+    # Pre-clustering ensures similar texts are in the same batch so the AI's own SELF-CHECK
+    # handles intra-batch deduplication; the registry handles cross-run consistency.
+    initial_registry = dict(canonical_registry)
 
-        current_items = pending_list[i : i + batch_size]
-        batch = "\n".join(current_items)
-        mapped_df = pd.DataFrame()
-
+    def _run_one_batch(args):
+        """Worker: process one batch (runs in thread pool, no shared state written)."""
+        batch_idx, batch_texts = args
+        batch_str = "\n".join(batch_texts)
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                mapped_df = get_ai_mapping(batch, type_label,
-                                           canonical_registry=canonical_registry)
-                break
-            except Exception as batch_error:
-                retryable = is_retryable_error(batch_error)
-                should_retry = retryable and attempt < MAX_RETRIES
-
-                print(f"      ⚠️ Batch {current_batch} attempt {attempt}/{MAX_RETRIES} failed: {batch_error}")
-                if should_retry:
+                return batch_idx, get_ai_mapping(batch_str, type_label,
+                                                  canonical_registry=initial_registry)
+            except Exception as err:
+                if is_retryable_error(err) and attempt < MAX_RETRIES:
                     delay = min(MAX_RETRY_SECONDS, BASE_RETRY_SECONDS * (2 ** (attempt - 1)))
-                    delay += random.uniform(0, 0.5)
-                    print(f"      🔁 Retrying in {delay:.1f}s...")
+                    delay += random.uniform(0, 0.3)
+                    print(f"      ⚠️ Batch {batch_idx+1} retry {attempt}: {err} — sleeping {delay:.1f}s")
                     time.sleep(delay)
                     continue
+                print(f"      ❌ Batch {batch_idx+1} failed after {attempt} attempt(s): {err}")
+                return batch_idx, pd.DataFrame()
+        return batch_idx, pd.DataFrame()
 
-                print(f"      ❌ Batch {current_batch} failed after {attempt} attempt(s).")
-                mapped_df = pd.DataFrame()
-                break
+    # ── PARALLEL EXECUTION ────────────────────────────────────────────────────
+    pending_flush: list = []   # in-memory accumulator; flushed every TAGGER_FLUSH_INTERVAL
+    completed = 0
 
-        if not mapped_df.empty:
-            # Update canonical registry with concepts produced by this batch
-            for concept, count in mapped_df['Merged_Concept'].value_counts().items():
-                canonical_registry[str(concept)] = canonical_registry.get(str(concept), 0) + int(count)
+    _t_start = time.time()
+    with ThreadPoolExecutor(max_workers=TAGGER_WORKERS) as executor:
+        future_map = {
+            executor.submit(_run_one_batch, (i, batch)): i
+            for i, batch in enumerate(batches)
+        }
+        for future in tqdm(as_completed(future_map), total=total_batches, desc=f"  {type_label}"):
+            batch_idx, mapped_df = future.result()
+            completed += 1
 
-            save_progress(output_csv, mapped_df)
-            registry_size = len(canonical_registry)
-            print(f"      ✅ Batch {current_batch} done. Saved {len(mapped_df)} rows. "
-                  f"Registry: {registry_size} labels.")
-        else:
-            print(f"      ⚠️ Batch {current_batch} produced no usable rows.")
+            if not mapped_df.empty:
+                for concept, count in mapped_df['Merged_Concept'].value_counts().items():
+                    canonical_registry[str(concept)] = (
+                        canonical_registry.get(str(concept), 0) + int(count)
+                    )
+                pending_flush.append(mapped_df)
+            else:
+                print(f"      ⚠️ Batch {batch_idx+1} produced no usable rows.", flush=True)
 
-        time.sleep(0.5) 
+            # Periodic disk flush to protect against crashes on large runs
+            if len(pending_flush) >= TAGGER_FLUSH_INTERVAL:
+                combined = pd.concat(pending_flush, ignore_index=True)
+                save_progress(output_csv, combined)
+                pending_flush.clear()
+                elapsed = time.time() - _t_start
+                rps = completed / elapsed if elapsed > 0 else 0
+                print(f"   💾 Flush at batch {batch_idx+1}: {completed}/{total_batches} done "
+                      f"| {rps:.2f} batches/s | Registry: {len(canonical_registry)} labels", flush=True)
 
+    # Final flush
+    if pending_flush:
+        combined = pd.concat(pending_flush, ignore_index=True)
+        save_progress(output_csv, combined)
+
+    elapsed_total = time.time() - _t_start
     if os.path.exists(output_csv):
-        final_rows = len(pd.read_csv(output_csv))
-        print(f"✅ Mapping successfully saved to {output_csv} | Total rows now: {final_rows}")
+        final_df = pd.read_csv(output_csv)
+        final_rows = len(final_df)
+        final_concepts = final_df['Merged_Concept'].nunique() if 'Merged_Concept' in final_df.columns else 0
+        print(f"✅ {type_label} mapping saved → {output_csv} | "
+              f"{final_rows:,} rows | {final_concepts:,} unique concepts | "
+              f"{elapsed_total/60:.1f} min")
 
 if __name__ == "__main__":
     # Ensure these files exist from Phase 1
